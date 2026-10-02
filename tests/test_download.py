@@ -3,8 +3,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from airec_client import ActiveRecordingError, AirecClient, Frame, ProtocolError, Recording
-from airec_client.client import ARCHIVE_NOTIFY
+from airec import ActiveRecordingError, AirecClient, Frame, ProtocolError, Recording
+from airec.client import ARCHIVE_NOTIFY
 from test_client import FakeBleak
 
 
@@ -50,7 +50,7 @@ class DownloadBleak(FakeBleak):
 
 class DownloadTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.delay_patch = patch("airec_client.client.asyncio.sleep", return_value=None)
+        self.delay_patch = patch("airec.client.asyncio.sleep", return_value=None)
         self.delay_patch.start()
         self.addCleanup(self.delay_patch.stop)
         self.client = AirecClient("fake", timeout=0.01, client_factory=DownloadBleak)

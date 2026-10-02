@@ -1,6 +1,49 @@
-# Python API
+# Python library
 
-All exports below come from `airec_client`. Device operations are asynchronous.
+All exports below come from `airec`. Device operations are asynchronous.
+Install with `pip install -e .` from the repository. For the command-line tool,
+see the [README](../README.md). For protocol details, see [research](research/).
+
+## Quick start
+
+```python
+import asyncio
+from pathlib import Path
+
+from airec import AirecClient, find_recorders, save_audio
+
+async def main():
+    recorders = await find_recorders()
+    if len(recorders) != 1:
+        raise SystemExit(f"expected one recorder, found {len(recorders)}")
+    async with AirecClient(recorders[0].device) as recorder:
+        print(await recorder.battery())
+        print(await recorder.storage())
+        recordings = await recorder.list_recordings()
+        for row in recordings:
+            print(row.recording_id, row.recorded_at, row.size_bytes)
+
+        # Download only while stopped; no implicit recording control.
+        if recordings and (await recorder.recording_status()).state == "stopped":
+            raw = await recorder.download_recording(recordings[0])
+            directory = Path("recordings")
+            directory.mkdir(exist_ok=True)
+            save_audio(raw, directory / f"{recordings[0].recording_id}.opus")
+
+asyncio.run(main())
+```
+
+## Finding recorders
+
+`await find_recorders(timeout=10.0) -> list[Recorder]` scans for `timeout`
+seconds. It returns devices whose advertised name starts with `AIREC`, ignoring
+case. It falls back to the OS-resolved name when the advertisement has no name.
+It does not filter on service UUID, because advertising may omit the primary
+service. It only listens to advertisements and never connects.
+
+`Recorder(name, address, rssi, device)` is an immutable dataclass. Pass
+`device` (a Bleak `BLEDevice`) to `AirecClient` to connect without a second
+address lookup. The name prefix was checked against one recorder only.
 
 ## Connection and errors
 

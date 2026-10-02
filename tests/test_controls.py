@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime, UTC
 from unittest.mock import patch
 
-from airec_client import ActiveRecordingError, AirecClient, Frame, ProtocolError
+from airec import ActiveRecordingError, AirecClient, Frame, ProtocolError
 from test_client import FakeBleak, ROW
 
 ID = ROW[:14].decode()
@@ -48,7 +48,7 @@ class ControlBleak(FakeBleak):
 
 class ControlTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        patcher = patch("airec_client.client.asyncio.sleep", return_value=None)
+        patcher = patch("airec.client.asyncio.sleep", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = AirecClient("fake", timeout=0.05, client_factory=ControlBleak)

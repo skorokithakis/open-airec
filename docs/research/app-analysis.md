@@ -17,7 +17,7 @@ The experimental [PyPI airec 0.1.0 package](https://pypi.org/project/airec/0.1.0
 provided initial framing/UUID clues and packet captures. It did not communicate
 successfully with the tested recorder before the real app initialization was
 recovered. Its command interpretations are not authoritative for this firmware.
-The new client implements the narrow app-derived behavior in `src/airec_client/`;
+The new client implements the narrow app-derived behavior in `src/airec/`;
 it does not require the upstream package or Android application at runtime.
 
 ## Recovered app evidence
@@ -95,4 +95,5 @@ not required for installation or testing. Further reverse engineering will
 require acquiring a compatible app snapshot again; this summary is not a
 replacement for full decompiled evidence when investigating new commands.
 
-See [protocol](protocol.md), [API](api.md), and [limitations](limitations.md).
+See [protocol](protocol.md), [technical limits](technical-limits.md),
+[library](../library.md) and [limitations](../limitations.md).

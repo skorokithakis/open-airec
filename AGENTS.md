@@ -1,16 +1,19 @@
 # AIREC client development
 
 This repository is a hardware-interface library, not a transcription/cloud app.
-Read README.md and docs/{api,protocol,limitations,app-analysis}.md before changing
-protocol behavior. The current implementation is src/airec_client/; tests/ uses
+README.md is the end-user guide; docs/library.md is the Python API; docs/research/
+holds protocol, app-analysis and technical-limits findings. Read docs/research/
+before changing protocol behavior. Never delete research findings; move or
+rewrite them instead. The current implementation is src/airec/; tests/ uses
 fake BLE transport and never accesses real hardware.
 
 ## Commands
 
 - Install: `.venv/bin/python -m pip install -e .`
-- Tests: `.venv/bin/python -m unittest discover -s tests -v` (76 tests at handoff)
+- Tests: `.venv/bin/python -m unittest discover -s tests -v` (103 tests at handoff)
 - Compile: `.venv/bin/python -m compileall -q src tests`
-- CLI: `.venv/bin/python -m airec_client --help`
+- CLI: `.venv/bin/python -m airec --help` (text output by default, `--json` for
+  scripts; recorder from --address, AIREC_ADDRESS, or a unique `AIREC*` name scan)
 
 Python >=3.12; Bleak >=0.22,<0.23. Only Linux/BlueZ, Bleak 0.22.3 and one recorder
 were hardware-validated. Other platforms/firmware remain unvalidated. The private
@@ -40,7 +43,7 @@ requires reviewing that compatibility dependency.
 ## Repository cleanup
 
 Obsolete APK/upstream package copies, decompilation and build output and one-off
-probes were removed after consolidating findings in docs/. Local session logs and
+probes were removed after consolidating findings in docs/research/. Local session logs and
 downloaded recordings were preserved but excluded from commits. Full original
 app evidence is not bundled; acquire a compatible snapshot before investigating
 new commands. Do not broadly index extracted APKs or generated assembly trees.

@@ -4,8 +4,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from airec_client import save_audio, to_ogg_opus
-from airec_client.audio import _packet_samples
+from airec import save_audio, to_ogg_opus
+from airec.audio import _packet_samples
 
 
 PACKET = b"\x48" + b"\0" * 79
@@ -74,7 +74,7 @@ class AudioTests(unittest.TestCase):
     def test_failed_publish_and_conversion_leave_no_partial_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "recording.opus"
-            with patch("airec_client.audio.os.link", side_effect=OSError("disk error")):
+            with patch("airec.audio.os.link", side_effect=OSError("disk error")):
                 with self.assertRaises(OSError):
                     save_audio(PACKET, path)
             self.assertEqual(list(path.parent.iterdir()), [])

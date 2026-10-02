@@ -1,0 +1,173 @@
+"""Query and control an AIREC voice recorder over Bluetooth."""
+
+import argparse
+import asyncio
+import os
+import sys
+from pathlib import Path
+from datetime import datetime
+from dataclasses import asdict
+
+from bleak import BleakScanner
+
+from . import AirecClient, save_audio
+from .client import _validate_recording_id
+from .report import render_json, render_text
+from .scan import find_recorders
+
+
+async def _select_device(address, timeout):
+    """Resolve the target BLEDevice, scanning only when no address is configured.
+
+    An explicit address (or AIREC_ADDRESS) is looked up directly. Otherwise a
+    scan must yield exactly one AIREC recorder; zero or multiple matches abort
+    with a listing rather than guessing.
+    """
+    address = address or os.environ.get("AIREC_ADDRESS")
+    if address:
+        device = await BleakScanner.find_device_by_address(address, timeout=timeout)
+        if device is None:
+            raise ConnectionError("selected recorder is not advertising")
+        return device
+    recorders = await find_recorders(timeout)
+    if not recorders:
+        raise ConnectionError("no AIREC recorder found; pass --address or set AIREC_ADDRESS")
+    if len(recorders) > 1:
+        found = ", ".join(f"{r.name} ({r.address})" for r in recorders)
+        raise ConnectionError(f"multiple AIREC recorders found; pass --address: {found}")
+    return recorders[0].device
+
+
+def _emit(command, payload, as_json):
+    if as_json:
+        print(render_json(command, payload))
+    else:
+        print(render_text(command, payload))
+
+
+_CONTROL_METHODS = {"status": "recording_status", "start": "start_recording",
+                    "pause": "pause_recording", "resume": "resume_recording",
+                    "stop": "stop_recording"}
+
+
+async def run(args):
+    command = args.command or "list"
+    if command == "scan":
+        recorders = await find_recorders(args.timeout)
+        _emit(command, {"recorders": [
+            {"name": r.name, "address": r.address, "rssi": r.rssi} for r in recorders]}, args.json)
+        return
+    destination = None
+    if command == "download":
+        _validate_recording_id(args.recording_id)
+        suffix = ".opus" if args.format == "opus" else ".airec"
+        destination = args.output or Path("recordings") / (args.recording_id + suffix)
+        if destination.exists() or destination.is_symlink():
+            raise FileExistsError(f"refusing to overwrite {destination}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    if command == "delete":
+        _validate_recording_id(args.recording_id)
+        if not args.yes:
+            raise ValueError("deletion is permanent; pass --yes to confirm")
+    clock_value = None
+    if command == "set-clock" and args.time:
+        clock_value = datetime.fromisoformat(args.time)
+        if clock_value.tzinfo is not None:
+            raise ValueError("supply device-local time without a timezone offset")
+    device = await _select_device(args.address, args.timeout)
+    async with AirecClient(device, timeout=args.timeout) as client:
+        if command == "storage":
+            storage = await client.storage()
+            payload = {**asdict(storage), "used_mb": storage.used_mb}
+        elif command in _CONTROL_METHODS:
+            result = await getattr(client, _CONTROL_METHODS[command])()
+            if command == "stop":
+                payload = {"finalized_recording_id": result.recording_id if result else None}
+            else:
+                payload = asdict(result)
+        elif command == "delete":
+            await client.delete_recording(args.recording_id)
+            payload = {"deleted_recording_id": args.recording_id}
+        elif command in ("clock", "set-clock"):
+            value = await client.set_clock(clock_value) if command == "set-clock" else await client.clock()
+            payload = {"device_local_time": value.isoformat()}
+        elif command == "download":
+            audio = await client.download_recording(
+                args.recording_id, timeout=args.download_timeout,
+                stop_if_recording=args.stop_recording,
+            )
+            save_audio(audio, destination, format=args.format)
+            payload = {"recording_id": args.recording_id, "path": str(destination),
+                       "raw_size_bytes": len(audio), "file_size_bytes": destination.stat().st_size}
+        else:
+            battery = await client.battery()
+            recordings = await client.list_recordings()
+            payload = {
+                "battery_percent": battery,
+                "recordings": [{
+                    "recording_id": row.recording_id,
+                    "recorded_at": row.recorded_at.isoformat(),
+                    "size_bytes": row.size_bytes,
+                } for row in recordings],
+            }
+    _emit(command, payload, args.json)
+
+
+def _global_option_parser(suppress_defaults=False):
+    """Parent parser for options accepted both before and after a command.
+
+    Subcommand copies suppress their defaults so an option given before the
+    subcommand survives the subparser's own namespace update.
+    """
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument("--address", default=argparse.SUPPRESS if suppress_defaults else None,
+                        help="explicit Bluetooth address (device UUID on macOS); "
+                             "defaults to $AIREC_ADDRESS, then a unique scan match")
+    parent.add_argument("--timeout", type=float,
+                        default=argparse.SUPPRESS if suppress_defaults else 10.0,
+                        help="seconds to wait for scanning and device replies (default: 10)")
+    parent.add_argument("--json", action="store_true",
+                        default=argparse.SUPPRESS if suppress_defaults else False,
+                        help="print machine-readable JSON instead of human-readable text")
+    return parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, parents=[_global_option_parser()])
+    command_options = _global_option_parser(suppress_defaults=True)
+    commands = parser.add_subparsers(dest="command")
+    commands.add_parser("scan", parents=[command_options],
+                        help="scan for AIREC recorders and print name, address and RSSI")
+    commands.add_parser("list", parents=[command_options], help="list recording metadata (the default)")
+    commands.add_parser("storage", parents=[command_options],
+                        help="read total, free and used storage in device-reported MB")
+    for name, help_text in (("status", "read recording state"), ("start", "start ordinary recording"),
+                            ("pause", "pause active recording"), ("resume", "resume paused recording"),
+                            ("stop", "stop/finalize current recording"), ("clock", "read device clock")):
+        commands.add_parser(name, parents=[command_options], help=help_text)
+    delete = commands.add_parser("delete", parents=[command_options],
+                                 help="permanently delete one archive; recorder must be stopped")
+    delete.add_argument("recording_id")
+    delete.add_argument("--yes", action="store_true", help="confirm permanent deletion")
+    clock = commands.add_parser("set-clock", parents=[command_options],
+                                help="set device clock; recorder must be stopped")
+    clock.add_argument("--time", help="local ISO datetime without timezone (default: computer local time)")
+    download = commands.add_parser("download", parents=[command_options],
+                                   help="download one recording; never deletes it")
+    download.add_argument("recording_id", help="14-digit ID from the catalog")
+    download.add_argument("--output", type=Path, help="destination (default: recordings/ID.opus)")
+    download.add_argument("--format", choices=("opus", "raw"), default="opus")
+    download.add_argument("--download-timeout", type=float, default=120.0)
+    download.add_argument("--stop-recording", action="store_true",
+                          help="allow stopping/finalizing an active or paused recording; does not restart it")
+    args = parser.parse_args()
+    try:
+        asyncio.run(run(args))
+    except (Exception, KeyboardInterrupt) as exc:
+        print(f"AIREC operation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

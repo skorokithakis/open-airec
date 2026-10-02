@@ -71,7 +71,7 @@ def to_ogg_opus(raw: bytes) -> bytes:
     if not raw or len(raw) % 80:
         raise ValueError("this audio profile requires nonempty 80-byte Opus packets")
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 0, 0, 0)
-    vendor = b"airec-client"
+    vendor = b"airec"
     tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
     output = bytearray(_page(head, 0, 0, 2) + _page(tags, 1, 0, 0))
     samples = 0

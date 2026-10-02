@@ -2,13 +2,13 @@ import asyncio
 import unittest
 from unittest.mock import patch
 
-from airec_client import AirecClient, Frame, ProtocolError, StorageInfo
+from airec import AirecClient, Frame, ProtocolError, StorageInfo
 from test_client import FakeBleak
 
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        patcher = patch("airec_client.client.asyncio.sleep", return_value=None)
+        patcher = patch("airec.client.asyncio.sleep", return_value=None)
         patcher.start()
         self.addCleanup(patcher.stop)
         self.client = AirecClient("fake", timeout=0.02, client_factory=FakeBleak)

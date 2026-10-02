@@ -3,8 +3,8 @@ import asyncio
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from airec_client import AirecClient, Frame, ProtocolError, Recording
-from airec_client.client import CONTROL_NOTIFY, CONTROL_WRITE, SERVICE
+from airec import AirecClient, Frame, ProtocolError, Recording
+from airec.client import CONTROL_NOTIFY, CONTROL_WRITE, SERVICE
 
 
 ROW = b"20261002023328" + bytes.fromhex("000053c0")
@@ -53,7 +53,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         return AirecClient("fake", timeout=0.01, client_factory=FakeBleak)
 
     async def asyncSetUp(self):
-        self.delay_patch = patch("airec_client.client.asyncio.sleep", return_value=None)
+        self.delay_patch = patch("airec.client.asyncio.sleep", return_value=None)
         self.delay_patch.start()
         self.addCleanup(self.delay_patch.stop)
 
@@ -137,7 +137,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_cleanup_preserves_original_error(self):
         client = self.make_client()
-        with self.assertLogs("airec_client.client", level="WARNING"):
+        with self.assertLogs("airec.client", level="WARNING"):
             with self.assertRaisesRegex(ValueError, "original failure"):
                 async with client:
                     async def fail():

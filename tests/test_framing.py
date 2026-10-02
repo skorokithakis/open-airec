@@ -1,6 +1,6 @@
 import unittest
 
-from airec_client.framing import Frame, FrameDecoder, encode_request
+from airec.framing import Frame, FrameDecoder, encode_request
 
 
 class FramingTests(unittest.TestCase):
