@@ -1,7 +1,9 @@
 # airec
 
+<!-- PyPI renders this README too. Keep image and link URLs absolute; relative paths break there. -->
+
 <p align="center">
-  <img src="misc/recorder.png" alt="The AIREC voice recorder" width="300">
+  <img src="https://raw.githubusercontent.com/skorokithakis/open-airec/main/misc/recorder.png" alt="The AIREC voice recorder" width="300">
 </p>
 
 `airec` lets you control an AIREC voice recorder from your computer over
@@ -42,7 +44,7 @@ recording by itself, so run `airec status` first.
 
 `airec` also lists, downloads and deletes single recordings, streams live
 audio, shows battery and storage, and changes device settings. See the
-[command-line guide](docs/cli.md).
+[command-line guide](https://github.com/skorokithakis/open-airec/blob/main/docs/cli.md).
 
 ## Use the Python library
 
@@ -68,14 +70,14 @@ async def main():
 asyncio.run(main())
 ```
 
-See the [library guide](docs/library.md) for the full API.
+See the [library guide](https://github.com/skorokithakis/open-airec/blob/main/docs/library.md) for the full API.
 
 ## More
 
-- [Command-line guide](docs/cli.md): every command, options and troubleshooting.
-- [Library guide](docs/library.md): the Python API.
-- [Limitations](docs/limitations.md): what does not work, and why.
-- [Development](docs/development.md): work on `airec` itself.
+- [Command-line guide](https://github.com/skorokithakis/open-airec/blob/main/docs/cli.md): every command, options and troubleshooting.
+- [Library guide](https://github.com/skorokithakis/open-airec/blob/main/docs/library.md): the Python API.
+- [Limitations](https://github.com/skorokithakis/open-airec/blob/main/docs/limitations.md): what does not work, and why.
+- [Development](https://github.com/skorokithakis/open-airec/blob/main/docs/development.md): work on `airec` itself.
 
 ## Privacy
 
@@ -84,4 +86,4 @@ Recordings stay on your computer.
 
 ## License
 
-[GNU Affero General Public License v3](LICENSE).
+[GNU Affero General Public License v3](https://github.com/skorokithakis/open-airec/blob/main/LICENSE).
