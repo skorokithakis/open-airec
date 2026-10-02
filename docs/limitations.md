@@ -53,7 +53,7 @@ cancel transfer and disconnect. Cleanup is best-effort if the radio disappears.
 
 ## Troubleshooting
 
-For common problems, see [When something goes wrong](../README.md#when-something-goes-wrong).
+For common problems, see [When something goes wrong](cli.md#when-something-goes-wrong).
 
 1. Confirm the recorder is powered on, nearby and not connected to the phone app.
 2. Confirm the selected address is still current (`airec scan`) and the OS

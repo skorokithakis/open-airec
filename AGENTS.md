@@ -1,13 +1,19 @@
 # AIREC client development
 
 This repository is a hardware-interface library, not a transcription/cloud app.
-README.md is the end-user guide; docs/library.md is the Python API; docs/research/
-holds protocol, app-analysis and technical-limits findings. Read docs/research/
+README.md is a short end-user overview; docs/cli.md is the full CLI guide;
+docs/library.md is the Python API; docs/development.md covers source installs,
+tests and releases; docs/research/ holds protocol, app-analysis and
+technical-limits findings. Read docs/research/
 before changing protocol behavior. Never delete research findings; move or
 rewrite them instead. The current implementation is src/airec/; tests/ uses
 fake BLE transport and never accesses real hardware.
 
 ## Commands
+
+Commit messages must use Conventional Commits (`feat:`, `fix:`, `docs:`,
+`chore:`...). Release Please builds versions and the changelog from them, and
+publishes to PyPI as `open-airec`; other messages are left out of releases.
 
 - Install: `.venv/bin/python -m pip install -e .`
 - Tests: `.venv/bin/python -m unittest discover -s tests -v` (210 tests at handoff)

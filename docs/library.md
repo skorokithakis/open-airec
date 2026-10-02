@@ -1,8 +1,8 @@
 # Python library
 
 All exports below come from `airec`. Device operations are asynchronous.
-Install with `pip install -e .` from the repository. For the command-line tool,
-see the [README](../README.md). For protocol details, see [research](research/).
+Install with `uv add open-airec` (or `pip install open-airec`). For the
+command-line tool, see the [command-line guide](cli.md). For protocol details, see [research](research/).
 
 ## Quick start
 
