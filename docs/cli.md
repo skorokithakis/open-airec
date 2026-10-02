@@ -147,8 +147,12 @@ an `error` message; the exit code is still nonzero.
 To finalize a recording that is still in progress and include it in the same
 run, add `--stop-recording`. To also delete each recording from the recorder
 right after it has been saved, add `--delete-after --yes`. Deletion is permanent;
-recordings that were already on your computer are never deleted. Without
-`--yes`, nothing is deleted.
+with `--delete-after`, every recording that has a saved file of the chosen
+`--format` in the directory is deleted from the recorder, including files that
+were already there before the run. The format must match the file already saved
+(for example, a `.airec` file is not recognized with the default `opus` format).
+A recording is not deleted when the existing path is not a regular, non-empty
+file, such as an empty file or a symlink. Without `--yes`, nothing is deleted.
 
 ### Record
 

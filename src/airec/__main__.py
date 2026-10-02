@@ -346,7 +346,8 @@ def main():
     sync.add_argument("--download-timeout", type=float, default=600.0,
                       help="seconds allowed per recording; default covers a full 60-minute segment")
     sync.add_argument("--delete-after", action="store_true",
-                      help="delete each recording from the recorder after it is saved locally")
+                      help="delete each recording from the recorder once its local "
+                           "output file exists (format must match)")
     sync.add_argument("--yes", action="store_true",
                       help="confirm permanent deletion (required with --delete-after)")
     listen = commands.add_parser("listen", parents=[command_options],

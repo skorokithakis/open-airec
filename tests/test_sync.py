@@ -23,11 +23,13 @@ def _recording(recording_id, data):
 class FakeSyncClient:
     """Connected-client double: records calls and serves configured outcomes."""
 
-    def __init__(self, recordings=(), *, status="stopped", audio=None, fail=None):
+    def __init__(self, recordings=(), *, status="stopped", audio=None, fail=None,
+                 delete_fail=None):
         self._recordings = tuple(recordings)
         self._status = status
         self._audio = dict(audio or {})
         self._fail = dict(fail or {})
+        self._delete_fail = set(delete_fail or ())
         self.calls = []
 
     async def recording_status(self):
@@ -51,6 +53,8 @@ class FakeSyncClient:
 
     async def delete_recording(self, recording_id):
         self.calls.append(("delete", recording_id))
+        if recording_id in self._delete_fail:
+            raise RuntimeError("simulated delete failure")
 
 
 class SyncDirectoryTests(unittest.IsolatedAsyncioTestCase):
@@ -175,13 +179,46 @@ class SyncDirectoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("regular file", str(caught.exception))
         self.assertNotIn(("download", ID1, 0, 600.0), client.calls)
 
-    async def test_delete_after_only_for_files_published_this_run(self):
+    async def test_delete_after_deletes_preexisting_file(self):
         self.output(ID1).write_bytes(b"already local")
         rows = (_recording(ID1, AUDIO1), _recording(ID2, AUDIO2))
         client = FakeSyncClient(rows, audio={ID1: AUDIO1, ID2: AUDIO2})
         events = await sync_directory(client, self.directory, format="raw", delete_after=True)
-        self.assertEqual([event.action for event in events], ["skipped", "downloaded", "deleted"])
-        self.assertEqual([call for call in client.calls if call[0] == "delete"], [("delete", ID2)])
+        self.assertEqual([event.action for event in events],
+                         ["skipped", "deleted", "downloaded", "deleted"])
+        self.assertEqual([call for call in client.calls if call[0] == "delete"],
+                         [("delete", ID1), ("delete", ID2)])
+
+    async def test_delete_after_skips_empty_file(self):
+        self.output(ID1).write_bytes(b"")
+        client = FakeSyncClient((_recording(ID1, AUDIO1),), audio={ID1: AUDIO1})
+        events = await sync_directory(client, self.directory, format="raw", delete_after=True)
+        self.assertEqual([event.action for event in events], ["skipped"])
+        self.assertEqual([call for call in client.calls if call[0] == "delete"], [])
+        self.assertEqual(self.output(ID1).read_bytes(), b"")
+
+    async def test_delete_after_skips_symlink(self):
+        target = self.directory / "target.airec"
+        target.write_bytes(AUDIO1)
+        self.output(ID1).symlink_to(target)
+        client = FakeSyncClient((_recording(ID1, AUDIO1),), audio={ID1: AUDIO1})
+        events = await sync_directory(client, self.directory, format="raw", delete_after=True)
+        self.assertEqual([event.action for event in events], ["skipped"])
+        self.assertEqual([call for call in client.calls if call[0] == "delete"], [])
+        self.assertTrue(self.output(ID1).is_symlink())
+
+    async def test_delete_failure_on_skipped_file_stops_run(self):
+        self.output(ID1).write_bytes(b"already local")
+        rows = (_recording(ID1, AUDIO1), _recording(ID2, AUDIO2))
+        client = FakeSyncClient(rows, audio={ID1: AUDIO1, ID2: AUDIO2}, delete_fail={ID1})
+        progress = []
+        with self.assertRaises(SyncFailed) as caught:
+            await sync_directory(client, self.directory, format="raw", delete_after=True,
+                                 progress=progress.append)
+        self.assertEqual([event.action for event in caught.exception.events], ["skipped", "failed"])
+        self.assertEqual([event.action for event in progress], ["skipped", "failed"])
+        self.assertIn("deleting", str(caught.exception))
+        self.assertNotIn(("download", ID2, 0, 600.0), client.calls)
 
     async def test_active_recording_refused_without_permission(self):
         client = FakeSyncClient((_recording(ID1, AUDIO1),), status="recording", audio={ID1: AUDIO1})

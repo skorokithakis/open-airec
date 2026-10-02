@@ -253,9 +253,12 @@ least as large as the catalog entry is discarded and restarted from zero. A
 `.part` that is not an ordinary regular file (for example a symlink) is refused.
 The `.part` file is removed only after the complete recording is published.
 
-`delete_after=True` calls `delete_recording()` for each recording this run
-published (resumed files included) only after its local file exists. Skipped
-files are never deleted. `progress(event)` is an optional synchronous callback
+`delete_after=True` calls `delete_recording()` for each recording whose local
+output file exists after processing, including files that were already present
+before the run (resumed files included). A pre-existing output is deleted only
+when it is a regular, non-empty file and not a symlink; otherwise the recording
+is left untouched. Deletion follows `format`, so only a saved file of the chosen
+format counts. `progress(event)` is an optional synchronous callback
 that receives one `SyncEvent` per recording. `SyncEvent` fields are `action`
 (`skipped`, `downloaded`, `resumed`, `deleted` or `failed`), `recording_id`,
 `bytes` (raw bytes transferred this run), `resumed_from` (nonzero resume offset

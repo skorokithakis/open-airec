@@ -70,6 +70,37 @@ def _append_partial(path: Path, data: bytes) -> None:
         os.fsync(handle.fileno())
 
 
+def _is_deletable_output(path: Path) -> bool:
+    """Whether a pre-existing output file may back a ``delete_after`` deletion.
+
+    Only a regular, non-empty file qualifies: a symlink (even to a regular file)
+    or an empty file is treated as not saved, so the recording is left alone.
+    """
+    if path.is_symlink() or not path.is_file():
+        return False
+    return path.stat().st_size > 0
+
+
+async def _delete_recording(
+    client: AirecClient, recording_id: str, events: list[SyncEvent],
+    progress: Callable[[SyncEvent], None] | None,
+) -> None:
+    """Delete one recording, emitting ``deleted`` or failing the run.
+
+    Shared by the post-download and skipped-output deletion paths so both stop
+    the run identically on failure.
+    """
+    try:
+        await client.delete_recording(recording_id)
+    except Exception as exc:
+        _record(events, progress, SyncEvent(
+            "failed", recording_id, error=f"{type(exc).__name__}: {exc}"))
+        raise SyncFailed(
+            f"sync stopped while deleting {recording_id}: {type(exc).__name__}: {exc}",
+            events) from exc
+    _record(events, progress, SyncEvent("deleted", recording_id))
+
+
 def _resume_prefix(part: Path, size: int) -> tuple[bytes, int]:
     """Return ``(prefix, offset)`` from a scratch file, or ``(b"", 0)``.
 
@@ -146,10 +177,13 @@ async def sync_directory(
     against the catalog size, and published with :func:`save_audio`.
     ``download_timeout`` is the per-file transfer deadline passed to
     :meth:`AirecClient.download_recording`; the default covers a full 60-minute
-    segment at measured BLE throughput. With
-    ``delete_after``, each recording that this run published is deleted from the
-    recorder immediately afterwards. The first failure stops the run and raises
-    :class:`SyncFailed`; rerunning continues from the remaining recordings.
+    segment at measured BLE throughput. With ``delete_after``, every recording
+    whose output file exists when it is reached is deleted from the recorder
+    immediately afterwards -- both just-published files and pre-existing ones. A
+    pre-existing output is deleted only when it is a regular, non-empty file and
+    not a symlink; otherwise the recording is left alone. The first failure stops
+    the run and raises :class:`SyncFailed`; rerunning continues from the
+    remaining recordings.
     """
     if format not in _EXTENSIONS:
         raise ValueError("format must be 'opus' or 'raw'")
@@ -172,6 +206,8 @@ async def sync_directory(
         destination = directory / f"{recording_id}{suffix}"
         if destination.exists() or destination.is_symlink():
             _record(events, progress, SyncEvent("skipped", recording_id))
+            if delete_after and _is_deletable_output(destination):
+                await _delete_recording(client, recording_id, events, progress)
             continue
 
         part = directory / f"{recording_id}.part"
@@ -190,14 +226,6 @@ async def sync_directory(
                 events) from exc
 
         if delete_after:
-            try:
-                await client.delete_recording(recording_id)
-            except Exception as exc:
-                _record(events, progress, SyncEvent(
-                    "failed", recording_id, error=f"{type(exc).__name__}: {exc}"))
-                raise SyncFailed(
-                    f"sync stopped while deleting {recording_id}: {type(exc).__name__}: {exc}",
-                    events) from exc
-            _record(events, progress, SyncEvent("deleted", recording_id))
+            await _delete_recording(client, recording_id, events, progress)
 
     return tuple(events)
