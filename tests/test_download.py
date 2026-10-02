@@ -97,6 +97,21 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(self.client._client.is_connected)
             await self.client.connect()
 
+    async def test_timeout_message_names_the_download_deadline(self):
+        self.client._client.events = []
+        with self.assertRaisesRegex(DownloadInterrupted, r"download: no reply within 0\.01 s"):
+            await self.client.download_recording(RECORDING, timeout=0.01)
+        self.assertFalse(self.client._client.is_connected)
+
+    async def test_inner_status_timeout_keeps_its_name_under_longer_overall_deadline(self):
+        # The client's query timeout (0.01 s) expiring before the 5 s overall
+        # download deadline must keep the inner step name, not be relabelled
+        # as the outer "download" deadline.
+        self.client._client.replies[15] = []
+        with self.assertRaisesRegex(TimeoutError, r"^download status: no reply within 0\.01 s$"):
+            await self.client.download_recording(RECORDING, timeout=5.0)
+        self.assertFalse(self.client._client.is_connected)
+
     async def test_partial_is_empty_without_a_matching_ack(self):
         # Pre-ack bytes cannot be attributed to this archive, so they are dropped.
         # A rejection invalidates any prefix even if an ack was already seen.

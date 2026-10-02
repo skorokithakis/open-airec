@@ -309,7 +309,8 @@ class AirecClient:
             raise ValueError("timeout must be finite and positive")
         self.timeout = timeout
         self.trace = trace
-        self._client = client_factory(device, disconnected_callback=self._disconnected)
+        self._client = client_factory(
+            device, disconnected_callback=self._disconnected, timeout=self.timeout)
         self._decoder = FrameDecoder()
         self._lock = asyncio.Lock()
         self._responses: asyncio.Queue[Frame | bytes | None] = asyncio.Queue(maxsize=4096)
@@ -383,7 +384,8 @@ class AirecClient:
             self._overflow = False
             self._drain()
             try:
-                await self._client.connect()
+                async with self._deadline(self.timeout, "connect"):
+                    await self._client.connect()
                 service = self._client.services.get_service(SERVICE)
                 if service is None:
                     raise ProtocolError("primary AIREC service is missing")
@@ -398,7 +400,7 @@ class AirecClient:
                 # The app delays getMac after MTU/PHY setup. See analysis notes.
                 await asyncio.sleep(0.2)
                 self._expected = {1}
-                async with asyncio.timeout(self.timeout):
+                async with self._deadline(self.timeout, "identity"):
                     await self._write(1)
                     frame = await self._receive(1)
                 if not frame.payload:
@@ -471,7 +473,8 @@ class AirecClient:
             # BlueZ's MaxWriteWithoutResponse property can stay at 20 even after
             # AcquireWrite returns MTU 247. Do not rely on the default MTU=23
             # reporting property. This is version-pinned in pyproject.toml.
-            await asyncio.wait_for(backend._acquire_mtu(), timeout=self.timeout)
+            async with self._deadline(self.timeout, "MTU"):
+                await backend._acquire_mtu()
             self._control_write_limit = backend._mtu_size - 3
 
     @staticmethod
@@ -503,13 +506,30 @@ class AirecClient:
             raise ConnectionError("connect and complete initialization first")
 
     @asynccontextmanager
-    async def _operation(self):
+    async def _deadline(self, seconds: float, step: str):
+        """Bound one wait and name the step only if this deadline expires.
+
+        A TimeoutError from a nested/earlier deadline or raised directly by the
+        body passes through unchanged, so only the wait this helper bounded is
+        annotated.
+        """
+        timeout = asyncio.timeout(seconds)
+        try:
+            async with timeout:
+                yield
+        except TimeoutError as exc:
+            if timeout.expired():
+                raise TimeoutError(f"{step}: no reply within {seconds:g} s") from exc
+            raise
+
+    @asynccontextmanager
+    async def _operation(self, step: str):
         """Serialize controls; never retry a possibly executed mutation."""
         async with self._lock:
             self._require_ready()
             self._drain()
             try:
-                async with asyncio.timeout(self.timeout):
+                async with self._deadline(self.timeout, step):
                     yield
             except BaseException:
                 self._ready = False
@@ -532,7 +552,7 @@ class AirecClient:
                                frame.payload[1:].decode("ascii") if code == 0 else None)
 
     async def recording_status(self) -> RecordingStatus:
-        async with self._operation():
+        async with self._operation("recording status"):
             return await self._recording_status()
 
     async def storage(self) -> StorageInfo:
@@ -541,7 +561,7 @@ class AirecClient:
         No partial result is returned on timeout, malformed data or device error.
         This does not pause/stop recording, delete files or format storage.
         """
-        async with self._operation():
+        async with self._operation("storage"):
             self._expected = {12, 13, 251}
             await self._write(11)
             values = {}
@@ -570,16 +590,16 @@ class AirecClient:
         return text
 
     async def firmware_version(self) -> str:
-        async with self._operation():
+        async with self._operation("firmware version"):
             return self._decode_text(await self._exchange(0x12), "firmware version")
 
     async def firmware_type(self) -> str:
-        async with self._operation():
+        async with self._operation("firmware type"):
             return self._decode_text(await self._exchange(0x29), "firmware type")
 
     async def chip_info(self) -> ChipInfo:
         """Read work mode and audio format from the single 0x20 reply byte."""
-        async with self._operation():
+        async with self._operation("chip info"):
             frame = await self._exchange(0x20)
             if len(frame.payload) != 1:
                 raise ProtocolError("chip info response must be exactly one byte")
@@ -587,7 +607,7 @@ class AirecClient:
             return ChipInfo(work_mode=value >> 4, audio_format=value & 0x0F)
 
     async def is_charging(self) -> bool:
-        async with self._operation():
+        async with self._operation("charging"):
             frame = await self._exchange(0x36)
             if len(frame.payload) != 1:
                 raise ProtocolError("charging response must be exactly one byte")
@@ -595,7 +615,7 @@ class AirecClient:
 
     async def device_settings(self) -> DeviceSettings:
         """Read the 0x26 settings snapshot; raw bytes are always retained."""
-        async with self._operation():
+        async with self._operation("settings"):
             frame = await self._exchange(0x26)
             return DeviceSettings.from_payload(frame.payload)
 
@@ -618,7 +638,7 @@ class AirecClient:
         A paused recording must be resumed explicitly. Recording continues after
         this operation; connection closure behavior remains firmware-dependent.
         """
-        async with self._operation():
+        async with self._operation("start recording"):
             status = await self._recording_status()
             if status.state == "recording":
                 return status
@@ -635,7 +655,8 @@ class AirecClient:
             return status
 
     async def _set_paused(self, paused: bool) -> RecordingStatus:
-        async with self._operation():
+        step = "pause recording" if paused else "resume recording"
+        async with self._operation(step):
             status = await self._recording_status()
             desired = "paused" if paused else "recording"
             if status.state == desired:
@@ -658,7 +679,7 @@ class AirecClient:
 
     async def stop_recording(self) -> Recording | None:
         """Finalize the active/paused recording; stopped is a no-op."""
-        async with self._operation():
+        async with self._operation("stop recording"):
             if (await self._recording_status()).state == "stopped":
                 return None
             frame = await self._exchange(4)
@@ -685,7 +706,7 @@ class AirecClient:
         files, retries a deletion, or exposes an erase-all/format command.
         """
         identity = _validate_recording_id(recording_id)
-        async with self._operation():
+        async with self._operation("delete"):
             if (await self._recording_status()).state != "stopped":
                 raise ActiveRecordingError("stop recording before deleting an archive")
             rows = await self._catalog()
@@ -705,7 +726,7 @@ class AirecClient:
 
     async def clock(self) -> datetime:
         """Read device-local wall time (no timezone on the wire)."""
-        async with self._operation():
+        async with self._operation("clock"):
             return await self._clock()
 
     async def set_clock(self, value: datetime | None = None) -> datetime:
@@ -717,7 +738,7 @@ class AirecClient:
         """
         if value is not None and (not isinstance(value, datetime) or value.tzinfo is not None):
             raise ValueError("clock must be a naive datetime in the device's local timezone")
-        async with self._operation():
+        async with self._operation("set clock"):
             if (await self._recording_status()).state != "stopped":
                 raise ActiveRecordingError("stop recording before setting the clock")
             value = (datetime.now() if value is None else value).replace(microsecond=0)
@@ -745,7 +766,7 @@ class AirecClient:
         if spec is None:
             raise ValueError(f"unknown setting: {name!r}")
         payload = _encode_setting(name, spec, value)
-        async with self._operation():
+        async with self._operation("set setting"):
             if (await self._recording_status()).state != "stopped":
                 raise ActiveRecordingError(f"stop recording before setting {name}")
             await self._write(spec.command, payload)
@@ -766,7 +787,7 @@ class AirecClient:
             self._drain()
             self._expected = {14}
             try:
-                async with asyncio.timeout(self.timeout):
+                async with self._deadline(self.timeout, "battery"):
                     await self._write(14)
                     frame = await self._receive(14)
                 if len(frame.payload) != 1 or frame.payload[0] > 100:
@@ -825,14 +846,14 @@ class AirecClient:
             audio = bytearray()
             acknowledged = False
             try:
-                async with asyncio.timeout(timeout):
-                    async with asyncio.timeout(self.timeout):
+                async with self._deadline(timeout, "download"):
+                    async with self._deadline(self.timeout, "download status"):
                         await self._write(15)
                         status_code = self._status_code(await self._receive(15))
                     if status_code in (0, 1):
                         if not stop_if_recording:
                             raise ActiveRecordingError("recorder has an active/paused recording; stop it or set stop_if_recording=True")
-                        async with asyncio.timeout(self.timeout):
+                        async with self._deadline(self.timeout, "download stop"):
                             await self._write(4)
                             stopped = await self._receive(4)
                             if len(stopped.payload) != 18:
@@ -892,7 +913,8 @@ class AirecClient:
                 self._download_active = False
                 if started and self._client.is_connected:
                     try:
-                        await asyncio.wait_for(self._write(8), timeout=min(self.timeout, 2.0))
+                        async with self._deadline(min(self.timeout, 2.0), "download stop transfer"):
+                            await self._write(8)
                     except Exception:
                         logging.getLogger(__name__).warning("Unable to stop failed transfer", exc_info=True)
                 try:
@@ -935,7 +957,7 @@ class AirecClient:
         paused, which only this client can cause while it holds the lock) is an
         unexpected silence and raises TimeoutError.
         """
-        async with asyncio.timeout(self.timeout):
+        async with self._deadline(self.timeout, "live audio status"):
             await self._write(15)
             frame = await self._receive(15)
         if self._status_code(frame) != 2:
@@ -974,7 +996,7 @@ class AirecClient:
             live = None
             attempted = False
             try:
-                async with asyncio.timeout(self.timeout):
+                async with self._deadline(self.timeout, "live audio status"):
                     await self._write(15)
                     status = self._status_code(await self._receive(15))
                 if status != 0:
@@ -1005,7 +1027,7 @@ class AirecClient:
                             await self._live_silence()
                             return
                         try:
-                            async with asyncio.timeout(remaining):
+                            async with self._deadline(remaining, "live audio"):
                                 event = await self._responses.get()
                         except TimeoutError:
                             continue
@@ -1066,5 +1088,5 @@ class AirecClient:
         marker is the only completeness evidence. Firmware may require further
         initialization on other models; this path remains experimental.
         """
-        async with self._operation():
+        async with self._operation("catalog"):
             return await self._catalog()

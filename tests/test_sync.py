@@ -300,8 +300,8 @@ class SyncTransportTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(delay.stop)
 
     def make_client(self, audios):
-        def factory(device, disconnected_callback):
-            return SyncBleak(device, disconnected_callback, audios=audios)
+        def factory(device, disconnected_callback, **kwargs):
+            return SyncBleak(device, disconnected_callback, audios=audios, **kwargs)
         return AirecClient("fake", timeout=0.01, client_factory=factory)
 
     async def test_full_download_over_fake_transport(self):

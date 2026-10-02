@@ -11,8 +11,9 @@ ROW = b"20261002023328" + bytes.fromhex("000053c0")
 
 
 class FakeBleak:
-    def __init__(self, device, disconnected_callback):
+    def __init__(self, device, disconnected_callback, timeout=10.0):
         self.disconnected_callback = disconnected_callback
+        self.timeout = timeout
         self.is_connected = False
         self.writes = []
         self.replies = {1: [Frame(1, b"000000000000001")],
@@ -78,7 +79,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         client = self.make_client()
         client._client.replies[5] = [Frame(5, ROW)]
         async with client:
-            with self.assertRaises(TimeoutError):
+            with self.assertRaisesRegex(TimeoutError, r"catalog: no reply within 0\.01 s"):
                 await client.list_recordings()
             with self.assertRaises(ConnectionError):
                 await client.battery()
@@ -86,10 +87,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_initialization_failure_disconnects(self):
         client = self.make_client()
         client._client.replies[1] = []
-        with self.assertRaises(TimeoutError):
+        with self.assertRaisesRegex(TimeoutError, r"identity: no reply within 0\.01 s"):
             await client.connect()
         self.assertFalse(client._client.is_connected)
         self.assertEqual(client._client.writes, [bytes.fromhex("55aa0101")])
+
+    async def test_direct_timeout_error_passes_through_unchanged(self):
+        # A TimeoutError raised in the body (deadline not expired) must keep its
+        # own object/message, e.g. the live-audio silence error.
+        client = self.make_client()
+        sentinel = TimeoutError("live audio produced no data within the timeout")
+        with self.assertRaises(TimeoutError) as caught:
+            async with client._deadline(5.0, "live audio"):
+                raise sentinel
+        self.assertIs(caught.exception, sentinel)
+
+    async def test_connect_timeout_is_named(self):
+        class HangingBleak(FakeBleak):
+            async def connect(self):
+                await asyncio.Event().wait()
+
+        client = AirecClient("fake", timeout=0.01, client_factory=HangingBleak)
+        with self.assertRaisesRegex(TimeoutError, r"connect: no reply within 0\.01 s"):
+            await client.connect()
+        self.assertFalse(client._client.is_connected)
 
     async def test_no_implicit_connection(self):
         with self.assertRaises(ConnectionError):

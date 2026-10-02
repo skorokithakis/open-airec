@@ -308,7 +308,9 @@ When a command fails, `airec` prints the reason and exits with a nonzero code.
 
 **A command timed out.** A timeout does not mean the command did nothing. The
 recorder may have done it and failed to reply. Run `airec status` or
-`airec list` to see the current state before you try again.
+`airec list` to see the current state before you try again. A weak Bluetooth
+signal is a common cause: check the dBm value from `airec scan` (values closer
+to 0 are stronger) and move the recorder closer to the computer.
 
 **"no AIREC recorder found".** Make sure the recorder is on, near the computer
 and not connected to the phone. Then run `airec scan`. If `scan` shows nothing,

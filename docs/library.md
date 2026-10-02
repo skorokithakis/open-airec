@@ -50,8 +50,10 @@ address lookup. The name prefix was checked against one recorder only.
 `AirecClient(device, *, timeout=10.0, trace=None, client_factory=BleakClient)`
 
 - `device`: explicit Bleak address/UUID or a discovered `BLEDevice` (preferred).
-- `timeout`: finite positive seconds for queries and control operations. Multi-step
-  controls/deletion share that deadline; discovery in the CLI also uses it.
+- `timeout`: finite positive seconds for queries, control operations and the
+  Bluetooth connect. Multi-step controls/deletion share that deadline; discovery
+  in the CLI also uses it. A timeout names the step that expired, e.g.
+  `catalog: no reply within 10 s`.
 - `trace(direction, data)`: synchronous optional callback for control bytes.
   Directions are `send`, `receive`, and `send_chunk` when requests are split.
   Raw audio is not traced, but identifiers/catalog metadata are. A callback
@@ -68,7 +70,8 @@ not guaranteed. There are no implicit connections or mutation retries.
 `DownloadInterrupted` extends it and adds `.partial` for a started transfer that
 failed before the verified end marker.
 `ConnectionError` signals disconnected/not initialized; `TimeoutError` signals a
-missing response/deadline. Invalid caller input raises `ValueError`; BLE/OS
+missing response/deadline, names the step and limit, and is also raised when the
+Bluetooth connect exceeds `timeout`. Invalid caller input raises `ValueError`; BLE/OS
 exceptions can also propagate. After operation failure, reconnect before reuse.
 Timeout never proves that a mutation did not execute. Context-manager cleanup
 preserves an original error if disconnection also fails.
