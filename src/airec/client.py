@@ -1,7 +1,8 @@
 """Narrow experimental client for the app's primary UUID profile.
 
-Queries, recording controls, single-file deletion and clock setting are exposed.
-OTA, reset and disk formatting are deliberately absent.
+Queries, recording controls, single-file deletion, clock setting and the
+hardware-confirmed single-value settings writes are exposed. OTA, reset and disk
+formatting are deliberately absent.
 Validated on one recorder, not all models.
 """
 
@@ -11,7 +12,7 @@ import math
 from dataclasses import dataclass
 from datetime import datetime
 from contextlib import asynccontextmanager
-from typing import Callable
+from typing import Callable, NamedTuple
 
 from bleak import BleakClient
 
@@ -28,6 +29,66 @@ def _validate_recording_id(value: str) -> bytes:
         raise ValueError("recording ID must be 14 ASCII digits")
     datetime.strptime(value, "%Y%m%d%H%M%S")
     return value.encode("ascii")
+
+
+# S2 hardware probe (2026-10-02) read each setting's 0x26 field back 1-2 s after
+# a single write; some setters never reply, so a short settle is needed before
+# the read-back. See docs/research/protocol.md "Settings setters".
+_SETTLE_DELAY = 1.0
+
+
+class _SettingSpec(NamedTuple):
+    command: int
+    field: str
+    width: int  # 0 marks an on/off switch; otherwise the big-endian byte width
+    low: int
+    high: int
+
+
+# Only setters that the S2 probe changed on hardware. Noise reduction (0x19) is
+# deliberately absent: it had no effect on the tested firmware.
+_SETTING_SETTERS: dict[str, _SettingSpec] = {
+    "led": _SettingSpec(0x18, "led", 0, 0, 1),
+    "power-on-record": _SettingSpec(0x2E, "power_on_record", 0, 0, 1),
+    "mic-gain": _SettingSpec(0x2A, "mic_gain", 1, 1, 7),
+    "segment-duration": _SettingSpec(0x22, "segment_duration", 2, 1, 600),
+    "idle-shutdown": _SettingSpec(0x39, "idle_shutdown", 4, 1, 525600),
+}
+_SETTING_BY_COMMAND = {spec.command: spec for spec in _SETTING_SETTERS.values()}
+
+# Public name list, used by the CLI to document and validate the setting name.
+SETTING_NAMES: tuple[str, ...] = tuple(_SETTING_SETTERS)
+
+
+def _encode_setting(name: str, spec: _SettingSpec, value) -> bytes:
+    """Validate and encode one setter payload; raise ValueError before any I/O."""
+    if spec.width == 0:
+        if type(value) is not bool:
+            raise ValueError(f"{name} value must be a boolean")
+        return b"\x01" if value else b"\x00"
+    if type(value) is not int or not spec.low <= value <= spec.high:
+        raise ValueError(f"{name} value must be an integer between {spec.low} and {spec.high}")
+    return value.to_bytes(spec.width, "big")
+
+
+def parse_setting_value(name: str, text: str):
+    """Parse a CLI string into a ``set_setting`` value; raise ValueError if invalid.
+
+    Public so the CLI can reject a bad name or value before connecting.
+    """
+    spec = _SETTING_SETTERS.get(name)
+    if spec is None:
+        raise ValueError(f"unknown setting: {name!r}")
+    if spec.width == 0:
+        if text not in ("on", "off"):
+            raise ValueError(f"{name} value must be 'on' or 'off'")
+        return text == "on"
+    try:
+        value = int(text)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} value must be an integer") from None
+    _encode_setting(name, spec, value)
+    return value
 
 
 class ProtocolError(RuntimeError):
@@ -119,7 +180,8 @@ class DeviceSettings:
     The layout is length-dependent. Segment duration and idle shutdown units are
     unconfirmed, so their raw integer values are reported without conversion.
     Boolean fields treat a nonzero byte as True. ``None`` marks a field the
-    reported length does not include. This is a read model; no setter exists.
+    reported length does not include. This is a read snapshot; the
+    hardware-confirmed subset of fields can be written with ``set_setting``.
     """
 
     noise_reduction: bool
@@ -338,6 +400,14 @@ class AirecClient:
         elif command == 33:
             if payload != b"R":
                 raise ValueError("only ordinary recording mode is supported")
+        elif command in _SETTING_BY_COMMAND:
+            spec = _SETTING_BY_COMMAND[command]
+            if spec.width == 0:
+                if payload not in (b"\x00", b"\x01"):
+                    raise ValueError("switch setting payload must be a single 0x00 or 0x01 byte")
+            elif (len(payload) != spec.width
+                  or not spec.low <= int.from_bytes(payload, "big") <= spec.high):
+                raise ValueError(f"setting 0x{command:02x} payload is out of range")
         elif command not in (1, 3, 4, 5, 8, 11, 14, 15, 16, 18, 32, 38, 41, 48, 54) or payload:
             raise ValueError("command is not an allowed query or download operation")
         data = encode_request(command, payload)
@@ -618,6 +688,38 @@ class AirecClient:
             if not 0 <= (actual - value).total_seconds() <= self.timeout + 2:
                 raise ProtocolError("recorder clock read-back differs from requested time")
             return actual
+
+    async def set_setting(self, name: str, value) -> DeviceSettings:
+        """Write one hardware-confirmed setting and verify the 0x26 read-back.
+
+        Supported names are ``led`` and ``power-on-record`` (bool), ``mic-gain``
+        (1-7), ``segment-duration`` (1-600 minutes) and ``idle-shutdown``
+        (1-525600 minutes). The value is validated before any I/O. Requires
+        stopped state. The write is sent once with no acknowledgement requirement,
+        no retry and no implicit stop; the returned snapshot is the 0x26 payload
+        read after the device settles, and its target field must equal the request.
+
+        Noise reduction (``0x19``) is deliberately not exposed: it did not change
+        the expected 0x26 field on the firmware this client was validated against.
+        """
+        spec = _SETTING_SETTERS.get(name)
+        if spec is None:
+            raise ValueError(f"unknown setting: {name!r}")
+        payload = _encode_setting(name, spec, value)
+        async with self._operation():
+            if (await self._recording_status()).state != "stopped":
+                raise ActiveRecordingError(f"stop recording before setting {name}")
+            await self._write(spec.command, payload)
+            # S2 hardware probe (2026-10-02): 0x2a/0x2e send no reply while
+            # 0x18/0x22/0x39 echo an empty same-opcode frame; the 0x26 field was
+            # read back 1-2 s later. Settle before reading. _receive drops the
+            # echo because only 0x26 is expected here.
+            await asyncio.sleep(_SETTLE_DELAY)
+            frame = await self._exchange(0x26)
+            settings = DeviceSettings.from_payload(frame.payload)
+            if getattr(settings, spec.field) != value:
+                raise ProtocolError(f"recorder did not apply setting {name!r}")
+            return settings
 
     async def battery(self) -> int:
         async with self._lock:

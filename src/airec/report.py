@@ -8,7 +8,7 @@ import json
 
 # Commands whose existing JSON output is compact (no indentation). All other
 # commands keep the indented shape the CLI already printed.
-_COMPACT_JSON_COMMANDS = frozenset({"stop", "delete", "clock", "set-clock"})
+_COMPACT_JSON_COMMANDS = frozenset({"stop", "delete", "clock", "set-clock", "set-setting"})
 
 _SIZE_UNITS = ("B", "KB", "MB", "GB", "TB")
 
@@ -89,15 +89,8 @@ def _flag(value) -> str:
     return "yes" if value else "no"
 
 
-def _info_text(payload: dict) -> str:
-    chip = payload["chip_info"]
-    settings = payload["device_settings"]
-    return "\n".join((
-        f"Firmware version: {payload['firmware_version']}",
-        f"Firmware type: {payload['firmware_type']}",
-        f"Chip work mode: {_named(chip['work_mode'], chip['work_mode_name'])}",
-        f"Chip audio format: {_named(chip['audio_format'], chip['audio_format_name'])}",
-        f"Charging: {_flag(payload['is_charging'])}",
+def _settings_lines(settings: dict) -> list[str]:
+    return [
         f"Device settings (raw {settings['raw']}):",
         f"  Noise reduction: {_flag(settings['noise_reduction'])}",
         f"  LED: {_flag(settings['led'])}",
@@ -109,7 +102,32 @@ def _info_text(payload: dict) -> str:
         f"  Disk format supported: {_flag(settings['disk_format_supported'])}",
         f"  Default Wi-Fi on: {_flag(settings['default_wifi_on'])}",
         f"  Default monitor on: {_flag(settings['default_monitor_on'])}",
+    ]
+
+
+def _info_text(payload: dict) -> str:
+    chip = payload["chip_info"]
+    return "\n".join((
+        f"Firmware version: {payload['firmware_version']}",
+        f"Firmware type: {payload['firmware_type']}",
+        f"Chip work mode: {_named(chip['work_mode'], chip['work_mode_name'])}",
+        f"Chip audio format: {_named(chip['audio_format'], chip['audio_format_name'])}",
+        f"Charging: {_flag(payload['is_charging'])}",
+        *_settings_lines(payload["device_settings"]),
     ))
+
+
+def _setting_value_text(value) -> str:
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+def _set_setting_text(payload: dict) -> str:
+    return "\n".join((f"Set {payload['setting']} to {_setting_value_text(payload['value'])}.",
+                      *_settings_lines(payload["device_settings"])))
 
 
 def _download_text(payload: dict) -> str:
@@ -160,6 +178,7 @@ _RENDERERS = {
     "delete": _delete_text,
     "clock": _clock_text,
     "set-clock": _clock_text,
+    "set-setting": _set_setting_text,
     "info": _info_text,
     "download": _download_text,
     "sync": _sync_text,

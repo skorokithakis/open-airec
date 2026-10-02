@@ -11,7 +11,8 @@ from dataclasses import asdict
 from bleak import BleakScanner
 
 from . import AirecClient
-from .client import DownloadInterrupted, _validate_recording_id
+from .client import (DownloadInterrupted, SETTING_NAMES, parse_setting_value,
+                     _validate_recording_id)
 from .report import render_json, render_sync_event, render_text
 from .scan import find_recorders
 from .sync import (SyncFailed, sync_directory, _DEFAULT_DOWNLOAD_TIMEOUT,
@@ -103,6 +104,9 @@ async def run(args):
         clock_value = datetime.fromisoformat(args.time)
         if clock_value.tzinfo is not None:
             raise ValueError("supply device-local time without a timezone offset")
+    setting_value = None
+    if command == "set-setting":
+        setting_value = parse_setting_value(args.name, args.value)
     device = await _select_device(args.address, args.timeout)
     async with AirecClient(device, timeout=args.timeout) as client:
         if command == "storage":
@@ -120,6 +124,10 @@ async def run(args):
         elif command in ("clock", "set-clock"):
             value = await client.set_clock(clock_value) if command == "set-clock" else await client.clock()
             payload = {"device_local_time": value.isoformat()}
+        elif command == "set-setting":
+            settings = await client.set_setting(args.name, setting_value)
+            payload = {"setting": args.name, "value": setting_value,
+                       "device_settings": {**asdict(settings), "raw": settings.raw.hex()}}
         elif command == "info":
             payload = await _info_payload(client)
         elif command == "download":
@@ -216,6 +224,10 @@ def main():
     clock = commands.add_parser("set-clock", parents=[command_options],
                                 help="set device clock; recorder must be stopped")
     clock.add_argument("--time", help="local ISO datetime without timezone (default: computer local time)")
+    setting = commands.add_parser("set-setting", parents=[command_options],
+                                  help="set one device setting; recorder must be stopped")
+    setting.add_argument("name", help=f"one of: {', '.join(SETTING_NAMES)}")
+    setting.add_argument("value", help="'on'/'off' for switches, otherwise an integer")
     download = commands.add_parser("download", parents=[command_options],
                                    help="download one recording; never deletes it")
     download.add_argument("recording_id", help="14-digit ID from the catalog")

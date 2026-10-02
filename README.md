@@ -234,7 +234,34 @@ Device settings (raw 010101003c0000001e01010101):
 `unknown` means the recorder's reply does not include that field. Segment
 duration and idle shutdown are raw values; their units are unconfirmed. If any
 one query fails, the whole command fails and prints nothing. Use `--json` for
-machine-readable output. There is no command to change these settings.
+machine-readable output.
+
+### Change device settings
+
+```bash
+airec set-setting led off
+airec set-setting power-on-record off
+airec set-setting mic-gain 5
+airec set-setting segment-duration 30
+airec set-setting idle-shutdown 60
+```
+
+The recorder must be stopped. Use `on`/`off` for the switch settings and an
+integer for the rest:
+
+| Name | Value | Meaning |
+| --- | --- | --- |
+| `led` | `on`/`off` | indicator LED |
+| `power-on-record` | `on`/`off` | start recording when the recorder powers on |
+| `mic-gain` | 1–7 | microphone gain |
+| `segment-duration` | 1–600 minutes | recording segment length |
+| `idle-shutdown` | 1–525600 minutes | idle shutdown time |
+
+The value is written once and then read back from the recorder; the command
+prints the resulting settings and fails if the recorder did not apply the
+value. It does not retry and never stops a recording for you. Noise reduction
+cannot be changed: the app sends `0x19`, but it had no effect on the tested
+firmware, so this client does not expose it.
 
 ### Set the clock
 

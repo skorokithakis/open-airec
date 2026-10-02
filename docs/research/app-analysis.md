@@ -50,12 +50,28 @@ stable APIs. Decompilation output is no longer distributed with this repository.
 | Excluded/dangerous opcodes | `ota/fireware_upgrade.dart` (`0x25`/`0x27`/`0x28`); `device_manage.dart` (`0x3c`, `0x34`); `WifiGetParamResponse.unpack` at `0x271a49c` (`0x64`) |
 | App opcode-table collisions | `protocol/command/key_profiles.dart`: `0x71` is upload-all/translation right, `0x02` is clock sync/custom key |
 | Device-originated frames | `key_profiles.dart` descriptions: `0x1a`/`0x1b`/`0x1c` device-button recording, `0x35`, `0x37` reminder, `0x3d` call state; `0x3b` realtime duration (BE s16). Unsolicited behaviour of `0x36`, `0x3b`, `0x3d` and one-key events is inferred |
+| `0x18`/`0x19` LED/noise setters | `ble_mgr.dart`, `ledSw` at `0x212ba5c` and `noiseSw` at `0x212c0c8` convert a bool to `1`/`0` in `field_f`; request classes `LedSwRequest`/`NoiseSwRequest` (manager.dart `1053`/`1066`) have no own `createValue`; the only plain `writeByte` body is `SetDefaultMonitorRequest.createValue` at `0x259e20c`; response classes `LedSwResponse` mapped to `AIREC_ledSw` at `0x18182c4`, `NoiseSwResponse` to `AIREC_noiseSw` at `0x1818344` |
+| `0x22` segment duration | `setting/manager.dart`, `DeviceRecordDurationRequest.createValue` at `0x259d2b4` writes BE `short` and clamps `<= 0` to 60; `ble_mgr.dart`, `deviceRecordDurationRequest` at `0x1850d68`; auto-sent at record start by `record_mgr.dart` `startRecordDevice` `0x1865acc` and `start` `0x1885de0` (600 = no segmentation) and on connect by `record_home.dart` `0x24950bc`; response `DeviceRecordDurationResponse` mapped at `0x1818444` |
+| `0x2a` mic gain | `ble_mgr.dart`, `setRecordVolumeRequest` at `0x212381c`; UI `_showPickerNumber` confirm closure calls it with an `int.parse` result at `0x21237a8`; default SP `"recordVolumeValue" = "4"` set by `record_home.dart` `0x2495498`; `initRecordVolumeList` (`device_manage.dart` `0x24bf76c`) builds 1..N items (N is 6 or 10 depending on `RecordMgr.field_13 == 0x10`, unresolved); key description gives range 1-7; response `SetRecordVolumeResponse` mapped at `0x181894c` |
+| `0x2e` power-on recording | `ble_mgr.dart`, `powerOnRecordRequest` at `0x212f204`; UI `_showPickerRecordType` calls it at `0x212f190`; `record_home.dart` default sequence forces 0 at `0x24957f4`; response `PowerOnRecordResponse` mapped at `0x1818e5c` |
+| `0x39` idle shutdown | `setting/manager.dart`, `IdleShutdownDurationNewRequest.createValue` at `0x259d884` writes BE `int`; `ble_mgr.dart`, `idleShutdownDurationRequest` at `0x21245f0` sends `0x23` then `0x39` after 100 ms (525600 -> `0x23` gets 240, `0x39` keeps 525600); picker option values at `0x254d5d8`-`0x254e2f0` (30/60/120/180/240/480/525600), default 60 set at `0x24c128c`; response `IdleShutdownDurationNewResponse` mapped at `0x1818544` |
+| Setter acks are unparsed | `setting_command.dart` maps each key to a `*Response` (e.g. `LedSwResponse` `0x18182c4`), but the six setter responses have no `unpack`; `SettingCommand.read` at `0x18a6e8c` dispatches `unpack`; `AIREC_CommandHelper.write` at `0x179733c` packs and awaits only the BLE write, and UI callers are fire-and-forget |
+| Setter sent while starting a recording | `record_mgr.dart` `startRecordDevice` `0x1865acc` and `start` `0x1885de0` send `0x22` (value 600) during record start; `realtime_monitor_page.dart` `_buildCmdItems` exposes `0x18` on/off (`0x2248eb8`/`0x2248f04`) from the live page command sheet |
 
 The app's command table corrects two upstream assumptions: `0x02` is **clock
 synchronization**, not download selection; `0x04` is **stop/finalize recording**,
 not a harmless current-file query. Do not reintroduce those older sequences.
 The app labels `6a` as OTA. This client never writes it, or any characteristic
 other than primary control `2a`.
+
+The six single-value settings setters (`0x18`, `0x19`, `0x22`, `0x2a`, `0x2e`,
+`0x39`) are documented in [protocol](protocol.md). The binary uses
+`dedup_instructions`, so the request classes for `0x18`, `0x19`, `0x2a` and `0x2e`
+have no `createValue` body of their own in the function table; the only plain
+single-byte writer is shared with `SetDefaultMonitorRequest`. Their payloads were
+therefore inferred. They were subsequently exercised on hardware (see the validation
+log): `0x18`, `0x2a`, `0x22`, `0x2e` and `0x39` changed the expected `0x26` field,
+while `0x19` did not. The app ignores their acknowledgements.
 
 The app is deliberately lenient where this client is strict. Its `0x07` handler
 never inspects the acknowledgement payload, so the app cannot tell us what the
@@ -112,6 +128,19 @@ phone app disconnected. No claim of compatibility with all AIREC models is made.
    carried the full catalog size at every offset, and each stream ended with
    `0x09`. A `0x08` stop was answered with `0x08`; no `0xfd` stop reply was seen.
    No setting, Wi-Fi, OTA, format or delete command was sent.
+7. **Settings setters (ticket S2):** with the recorder stopped and the phone app
+   disconnected, each app-derived single-value setter was written once, `0x26` was
+   read back, and the original restored with one write (except power-on recording,
+   which was left off). `0x2e` (`55 aa 02 2e 00`) turned power-on recording off and
+   was left off, with no reply. `0x18` (`00`) cleared `[1]` and returned `aa 55 01 18`;
+   restoring `01` returned the same frame. `0x2a` (`02`) moved mic gain `[10]`
+   `01` -> `02` with no reply. `0x22` (`003d`) moved segment duration `[3:5]`
+   `003c` -> `003d` and returned `aa 55 01 22`. `0x39` (`0000003c`) moved idle
+   shutdown `[5:9]` `0000001e` -> `0000003c` and returned `aa 55 01 39`, with no
+   `0x23` sent. `0x19` (`00`) produced no reply and no `0x26` change after a 4 s
+   settle, so it is dropped pending re-investigation. The final `0x26` had power-on
+   recording off and every other value equal to the baseline. Missing acks occurred
+   for writes that did take effect, so a missing ack is not a failure.
 
 Connections were closed after validation. No existing archived recording was
 explicitly deleted, and no firmware-update, reset or disk-format command was sent

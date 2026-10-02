@@ -55,7 +55,8 @@ user-facing limits, see [limitations](../limitations.md).
   the observed unsolicited `0x0a` is unconfirmed.
 - Never query `0x64` (it returns stored Wi-Fi credentials) and never send the OTA,
   format or bulk-delete opcodes (`0x25`, `0x27`, `0x28`, `0x3c`, `0x34`), Wi-Fi
-  writes or setting writes. See [protocol](protocol.md#excluded-commands).
+  writes or any setting write not exposed by `set_setting` (for example `0x19`,
+  `0x23`/`0x24`). See [protocol](protocol.md#excluded-commands).
 - These findings rely on one recorder and firmware. New commands require acquiring
   a compatible APK snapshot again; the decompiled evidence is not distributed.
 

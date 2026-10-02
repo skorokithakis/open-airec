@@ -112,6 +112,85 @@ frames identified from the app are `0x1a`/`0x1b`/`0x1c` (device-button recording
 `0x35`, `0x37` (shutdown reminder), `0x3d` (call state) and the one-key events
 `0x31`-`0x33`/`0x41`-`0x43`.
 
+## Settings setters
+
+These are the six single-value settings writes recovered from app 2.1.3. The client
+exposes the five hardware-confirmed setters through `set_setting`; the rest are
+not sent. Every payload is the little list in the settings UI: the
+request is `55 aa len cmd value` where `len = len(value)+1`, and the app registers a
+response class under the same opcode. The app does **not** decode, validate or await
+the ack: the callers are fire-and-forget and the `*Response` classes for all six have
+no `unpack` (only a `toString`). The reply payload is therefore unconstrained; only
+the opcode matters.
+
+All six were exercised on one recorder on 2026-10-02 (ticket S2). Status is the
+observed hardware result: **HW** = the write changed the expected `0x26` field and
+the original read back after a single restore write; **DROPPED** = no effect on
+`0x26`; **static** = app evidence only.
+
+| Cmd | Name | Payload (after `55 aa len cmd`) | Value/encoding | Reply observed | `0x26` field it changes | Status |
+| --- | --- | --- | --- | --- | --- | --- |
+| `0x18` | LED switch | `<1 byte>` | `01` on / `00` off | `aa 55 01 18` (empty) | `[1]` `led_light` | **HW** |
+| `0x19` | noise reduction | `<1 byte>` | `01` / `00` | none | `[0]` `noiseState` (unchanged) | **DROPPED** |
+| `0x22` | recording segment duration | `<2 bytes BE>` | u16 minutes; `<= 0` clamped to 60; 600 = no segmentation | `aa 55 01 22` (empty) | `[3:5]` `deviceRecordDuration` BE s16 | **HW** |
+| `0x2a` | mic gain | `<1 byte>` | 1-7 (key description); app default 4 | none | `mic_gain` u8 | **HW** |
+| `0x2e` | power-on recording | `<1 byte>` | `01` / `00` | none | `power_on_record` u8 | **HW** |
+| `0x39` | idle shutdown time | `<4 bytes BE>` | u32; picker 30/60/120/180/240/480/525600, default 60 | `aa 55 01 39` (empty) | idle shutdown u32 (13-byte `0x26`) | **HW** |
+
+Hardware results (one recorder, 2026-10-02, recorder stopped, phone app
+disconnected; the `0x26` payload was 13 bytes). Each setter was written once, `0x26`
+was read back, then the field was restored with one write and read back again:
+
+- `55 aa 02 2e 00` left power-on recording off (`[11]`: `01` -> `00`). No
+  same-opcode reply. Not restored; it must end off.
+- `55 aa 02 18 00` cleared `[1]` (`01` -> `00`); `55 aa 02 18 01` restored it. Both
+  writes were answered with `aa 55 01 18` (empty payload).
+- `55 aa 02 19 00` produced no reply and no change to `[0]` (still `01`) after a 4 s
+  settle, so `0x19` is dropped: it does not drive the `0x26` noise field on this
+  firmware.
+- `55 aa 02 2a 02` set `[10]` (`01` -> `02`); `55 aa 02 2a 01` restored it. No reply.
+- `55 aa 03 22 00 3d` set `[3:5]` (`003c` -> `003d`); `55 aa 03 22 00 3c` restored it.
+  Both writes answered with `aa 55 01 22`.
+- `55 aa 05 39 00 00 00 3c` set `[5:9]` (`0000001e` -> `0000003c`); the original
+  `55 aa 05 39 00 00 00 1e` restored it. Both writes answered with `aa 55 01 39`.
+  `0x39` works alone; no `0x23` is needed.
+
+Notes and risks:
+
+- **Acks are optional and their absence is not failure.** `0x18`, `0x22` and `0x39`
+  returned an empty same-opcode frame, while `0x2a` and `0x2e` returned nothing yet
+  still changed `0x26`. Every observed reply payload was empty. A caller must
+  confirm via a `0x26` read-back; treat a missing same-opcode ack as unconfirmed
+  success, not failure.
+- **Shared/merged `createValue` bodies.** The binary uses `dedup_instructions`. The
+  full function table for the request classes has only 17 distinct `createValue`
+  bodies; `0x18`, `0x19`, `0x2a` and `0x2e` have no body of their own. The only
+  plain single-byte writer in the table is `SetDefaultMonitorRequest::createValue`
+  at `0x259e20c` (`writeByte(field_f)`), so by elimination the four single-byte
+  setters share that code. Hardware: `0x18`, `0x2a` and `0x2e` did change the
+  expected field with the byte written directly, but `0x19` did not, so the shared
+  body cannot be assumed to cover `0x19` on this firmware.
+- **`0x22` is also written automatically, including at record start.** The app sends
+  it on connect correction and from `AIREC_RecordMgr.start`/`startRecordDevice` just as
+  recording starts, using 600 for "no segmentation" and otherwise the saved user
+  value. A client must not treat this as a user action. All six setters were
+  validated only while stopped.
+- **While recording.** `0x22` is sent around the record-start transition, and the
+  live recorder page's command sheet can send `0x18` on/off. The settings-page paths
+  (`0x19`, `0x2a`, `0x2e`, `0x39`) had no recording-state guard in the code, but the
+  S2 probe required stopped state and did not exercise them while recording.
+- **`0x39` is paired with `0x23` in the app but does not need it.** The app sends
+  `0x23` and, 100 ms later, `0x39` with the same value (525600 -> `0x23` gets 240
+  while `0x39` keeps 525600). On hardware, `0x39` alone changed the `0x26` idle
+  field, so `0x23` is not required and remains excluded/never sent.
+- **LED polarity is resolved.** The key description "是否关闭指示灯" (whether to
+  turn the indicator *off*) suggested an inverted meaning, but payload `01` sets
+  `[1]` (register `led_light`) and payload `00` clears it, matching the app's debug
+  label "LED 开" (LED on): `01` = LED on, `00` = LED off. Only the register mapping
+  was observed; the physical LED was not visually confirmed.
+- No setter-specific failure reply was observed. Do not invent one; treat a missing
+  same-opcode ack as unconfirmed success and verify with `0x26`.
+
 ## Excluded commands
 
 These are never sent by this client. They are OTA, destructive, credential-bearing
@@ -124,9 +203,10 @@ or state-changing, and several were not validated on hardware.
 - `0x34`: delete-file-count. Semantics unknown; treat as destructive.
 - `0x64`: returns the stored Wi-Fi SSID and password. Never query it.
 - `0x60`-`0x63` and `0x66`-`0x69`, `0x6c`: Wi-Fi set/delete/link/unlink/mode and
-  transfer commands. Wi-Fi hardware remains unconfirmed.
-- Settings writes: `0x18`, `0x19`, `0x22`-`0x24`, `0x2a`-`0x2e`, `0x38`-`0x3f`,
-  `0x6d`, `0x6e`, `0x71`, `0x72`, `0x77`-`0x7b`.
+  transfer commands. Wi-Fi hardware remains unconfirmed. See [Wi-Fi](wifi.md).
+- Settings writes not exposed by `set_setting`: `0x19`, `0x23`, `0x24`,
+  `0x2b`-`0x2d`, `0x38`, `0x3a`-`0x3f`, `0x6d`, `0x6e`, `0x71`, `0x72`,
+  `0x77`-`0x7b`.
 - `0x37` is device-originated (shutdown reminder), not a request.
 
 ## Sequences and safeguards

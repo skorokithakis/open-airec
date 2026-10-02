@@ -103,7 +103,7 @@ Models are immutable dataclasses:
   `work_mode_name` and `audio_format_name` return an app-derived display name, or
   `None` when the code is unknown. The app's derived `chipType` mapping is not
   exposed.
-- `DeviceSettings`: a read-only snapshot of the variable-length 0x26 reply. It
+- `DeviceSettings`: a snapshot of the variable-length 0x26 reply. It
   carries `noise_reduction`, `led`, `segment_duration`, `idle_shutdown`,
   `usb_support`, `mic_gain`, `power_on_record`, `disk_format_supported`,
   `default_wifi_on` and `default_monitor_on`, plus the exact `raw` payload bytes.
@@ -236,6 +236,19 @@ naive datetime; microseconds are dropped. Convert aware datetimes yourself to th
 intended wall timezone and then remove timezone information. It sends the timestamp,
 requires an empty acknowledgement, reads back and permits nonnegative drift up
 to `timeout + 2` seconds. Existing archive IDs are not renamed.
+
+`await set_setting(name: str, value) -> DeviceSettings` writes one of the
+hardware-confirmed single-value settings and returns the verified `0x26` snapshot.
+Supported names are `led` and `power-on-record` (`bool`), `mic-gain` (1–7),
+`segment-duration` (1–600 minutes) and `idle-shutdown` (1–525600 minutes). The
+name and value are validated before any I/O (`ValueError` otherwise). It requires
+stopped status, sends the write exactly once, waits for the device to apply it,
+then reads `0x26` and requires the target field to equal the requested value; a
+mismatch raises `ProtocolError`. There is no acknowledgement requirement, retry
+or implicit stop. Noise reduction (`0x19`) is not exposed because it did not
+change the expected `0x26` field on the tested firmware. `parse_setting_value(name,
+text)` converts a CLI-style `on`/`off` or integer string, rejecting bad input
+before connecting.
 
 ## Framing utilities
 
