@@ -5,10 +5,17 @@ This does not decode, transcribe or re-encode audio. Packet timing follows RFC
 unknown, so pre-skip is zero rather than inventing a trimming value.
 """
 
+import io
 import os
 import struct
 import tempfile
 from pathlib import Path
+
+
+_OPUS_HEAD = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 0, 0, 0)
+_OPUS_VENDOR = b"airec"
+_OPUS_TAGS = (b"OpusTags" + struct.pack("<I", len(_OPUS_VENDOR)) + _OPUS_VENDOR
+              + struct.pack("<I", 0))
 
 
 def _crc_table() -> tuple[int, ...]:
@@ -84,17 +91,55 @@ def to_ogg_opus(raw: bytes) -> bytes:
             _packet_samples(tail)
         except (ValueError, IndexError):
             raise ValueError("truncated final packet has an invalid TOC byte") from None
-    head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 0, 0, 0)
-    vendor = b"airec"
-    tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
-    output = bytearray(_page(head, 0, 0, 2) + _page(tags, 1, 0, 0))
-    samples = 0
-    for index, start in enumerate(range(0, usable, 80), 2):
-        packet = raw[start:start + 80]
-        samples += _packet_samples(packet)
-        flags = 4 if start + 80 == usable else 0
-        output.extend(_page(packet, index, samples, flags))
-    return bytes(output)
+    output = io.BytesIO()
+    writer = OggOpusWriter(output)
+    for start in range(0, usable, 80):
+        writer.write_packet(raw[start:start + 80])
+    writer.finish()
+    return output.getvalue()
+
+
+class OggOpusWriter:
+    """Incrementally write a mono Ogg Opus stream of 80-byte packets.
+
+    The OpusHead and OpusTags header pages are written on construction, then
+    `write_packet(packet)` queues each 80-byte packet and flushes the previous
+    one as its own page with a running granule position and sequence number.
+    Call `finish()` to mark the last flushed page as end-of-stream. A writer
+    that is never finished leaves a stream without an EOS page: every page it
+    has flushed is complete and playable, only the most recently queued packet
+    is not yet written. This is what makes Ctrl-C output salvageable.
+    """
+
+    def __init__(self, output):
+        self._output = output
+        self._sequence = 2
+        self._samples = 0
+        self._pending = None
+        self._finished = False
+        output.write(_page(_OPUS_HEAD, 0, 0, 2))
+        output.write(_page(_OPUS_TAGS, 1, 0, 0))
+
+    def write_packet(self, packet: bytes) -> None:
+        """Queue one fixed-size packet, flushing the previously queued one."""
+        if self._finished:
+            raise ValueError("cannot write to a finished Ogg Opus writer")
+        if len(packet) != 80:
+            raise ValueError("live archive packets must be exactly 80 bytes")
+        if self._pending is not None:
+            self._output.write(_page(self._pending, self._sequence, self._samples, 0))
+            self._sequence += 1
+        self._samples += _packet_samples(packet)
+        self._pending = packet
+
+    def finish(self) -> None:
+        """Flush the queued packet as the EOS page. Safe to call twice."""
+        if self._finished:
+            return
+        self._finished = True
+        if self._pending is not None:
+            self._output.write(_page(self._pending, self._sequence, self._samples, 4))
+            self._pending = None
 
 
 def save_audio(raw: bytes, destination: str | Path, *, format: str = "opus") -> Path:

@@ -2,6 +2,7 @@
 
 import argparse
 import asyncio
+import contextlib
 import os
 import sys
 from pathlib import Path
@@ -11,6 +12,7 @@ from dataclasses import asdict
 from bleak import BleakScanner
 
 from . import AirecClient
+from .audio import OggOpusWriter
 from .client import (DownloadInterrupted, SETTING_NAMES, parse_setting_value,
                      _validate_recording_id)
 from .report import render_json, render_sync_event, render_text
@@ -69,6 +71,90 @@ async def _info_payload(client):
     }
 
 
+def _binary_stdout():
+    """Byte stream used by ``listen -o -``; a seam for tests and broken pipes."""
+    return sys.stdout.buffer
+
+
+def _finish_quietly(writer):
+    """Best-effort EOS page; a closed pipe must not replace the real outcome."""
+    try:
+        writer.finish()
+    except (OSError, ValueError):
+        pass
+
+
+def _flush_quietly(stream):
+    try:
+        stream.flush()
+    except (OSError, ValueError):
+        pass
+
+
+def _silence_stdout():
+    """Point fd 1 at the null device after a broken pipe so shutdown stays quiet."""
+    try:
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        try:
+            os.dup2(devnull, sys.stdout.fileno())
+        finally:
+            os.close(devnull)
+    except (OSError, ValueError, AttributeError):
+        pass
+
+
+def _listen_summary(packets, reason):
+    # One live packet is one 20 ms frame (docs/research/live-audio.md).
+    return f"Listened {packets * 0.02:.1f} s ({packets} packets); ended: {reason}."
+
+
+async def _listen(client, output):
+    """Stream live audio to ``output`` (``"-"`` is binary stdout) until it ends.
+
+    Header and data pages are flushed as they are produced, so an interrupted or
+    killed process leaves a playable prefix. A clean end and Ctrl-C write the EOS
+    page; an error keeps the prefix without one and propagates. The summary goes
+    to stderr only, so ``-o -`` carries nothing but audio on stdout.
+    """
+    target = None
+    close_target = output != "-"
+    writer = None
+    packets = 0
+    reason = "stream ended"
+    print("Listening for live audio; press Ctrl-C to stop.", file=sys.stderr)
+    try:
+        target = _binary_stdout() if output == "-" else open(output, "xb")
+        writer = OggOpusWriter(target)  # header pages go out inside the protected block
+        target.flush()  # publish the Ogg header pages before any audio arrives
+        async with contextlib.aclosing(client.live_audio()) as stream:
+            async for packet in stream:
+                writer.write_packet(packet)
+                packets += 1
+                target.flush()
+        writer.finish()
+        target.flush()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        # Ctrl-C cancels the task; keep the prefix and close it with an EOS page.
+        if writer is not None:
+            _finish_quietly(writer)
+        if target is not None:
+            _flush_quietly(target)
+        reason = "interrupted"
+    except BrokenPipeError:
+        # The player closed its end of the pipe; end quietly.
+        reason = "output closed"
+        _silence_stdout()
+    except BaseException:
+        reason = "error"
+        raise
+    finally:
+        try:
+            if target is not None and close_target:
+                target.close()
+        finally:
+            print(_listen_summary(packets, reason), file=sys.stderr)
+
+
 _CONTROL_METHODS = {"status": "recording_status", "start": "start_recording",
                     "pause": "pause_recording", "resume": "resume_recording",
                     "stop": "stop_recording"}
@@ -93,6 +179,14 @@ async def run(args):
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"refusing to overwrite {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
+    if command == "listen":
+        if args.json:
+            raise ValueError("listen writes audio to stdout and text to stderr; --json is not supported")
+        if args.output != "-":
+            listen_output = Path(args.output)
+            listen_output.parent.mkdir(parents=True, exist_ok=True)
+            if listen_output.exists() or listen_output.is_symlink():
+                raise FileExistsError(f"refusing to overwrite {listen_output}")
     if command == "delete":
         _validate_recording_id(args.recording_id)
         if not args.yes:
@@ -130,6 +224,9 @@ async def run(args):
                        "device_settings": {**asdict(settings), "raw": settings.raw.hex()}}
         elif command == "info":
             payload = await _info_payload(client)
+        elif command == "listen":
+            await _listen(client, args.output)
+            return
         elif command == "download":
             matches = [row for row in await client.list_recordings()
                        if row.recording_id == args.recording_id]
@@ -252,6 +349,11 @@ def main():
                       help="delete each recording from the recorder after it is saved locally")
     sync.add_argument("--yes", action="store_true",
                       help="confirm permanent deletion (required with --delete-after)")
+    listen = commands.add_parser("listen", parents=[command_options],
+                                 help="stream an active recording's live audio as Ogg Opus")
+    listen.add_argument("-o", "--output", required=True, metavar="FILE|-",
+                        help="write Ogg Opus to FILE (refused if the file exists) or '-' for "
+                             "stdout; the summary is text on stderr, so --json is not supported")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

@@ -1,17 +1,45 @@
+import io
 import struct
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from airec import save_audio, to_ogg_opus
-from airec.audio import _packet_samples
+from airec import OggOpusWriter, save_audio, to_ogg_opus
+from airec.audio import _packet_samples, _page
 
 
 PACKET = b"\x48" + b"\0" * 79
 # Real firmware-truncated final slot: TOC 0x4b, frame count 0x41, padding
 # length 0x47, then padding to 48 bytes.
 TRUNCATED_TAIL = b"\x4b\x41\x47" + b"\0" * 45
+
+
+def reference_output(raw):
+    """Rebuild the legacy page layout independently of OggOpusWriter."""
+    usable = len(raw) - len(raw) % 80
+    head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 0, 0, 0)
+    vendor = b"airec"
+    tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
+    output = bytearray(_page(head, 0, 0, 2) + _page(tags, 1, 0, 0))
+    samples = 0
+    for index, start in enumerate(range(0, usable, 80), 2):
+        packet = raw[start:start + 80]
+        samples += _packet_samples(packet)
+        flags = 4 if start + 80 == usable else 0
+        output.extend(_page(packet, index, samples, flags))
+    return bytes(output)
+
+
+def incremental_output(raw):
+    """Build the same stream through the incremental writer."""
+    usable = len(raw) - len(raw) % 80
+    output = io.BytesIO()
+    writer = OggOpusWriter(output)
+    for start in range(0, usable, 80):
+        writer.write_packet(raw[start:start + 80])
+    writer.finish()
+    return output.getvalue()
 
 
 def pages(data):
@@ -70,6 +98,38 @@ class AudioTests(unittest.TestCase):
         self.assertEqual(len(TRUNCATED_TAIL), 48)
         self.assertEqual(to_ogg_opus(PACKET * 3 + TRUNCATED_TAIL),
                          to_ogg_opus(PACKET * 3))
+
+    def test_incremental_writer_is_byte_identical(self):
+        # Aligned input and a firmware-truncated tail must both match the
+        # legacy full-buffer layout exactly, page for page.
+        for name, data in (("aligned", PACKET * 4),
+                           ("truncated", PACKET * 3 + TRUNCATED_TAIL)):
+            with self.subTest(name):
+                expected = reference_output(data)
+                self.assertEqual(to_ogg_opus(data), expected)
+                self.assertEqual(incremental_output(data), expected)
+
+    def test_unfinished_writer_is_playable_prefix_without_eos(self):
+        output = io.BytesIO()
+        writer = OggOpusWriter(output)
+        for packet in (PACKET, PACKET, PACKET):
+            writer.write_packet(packet)
+        partial = output.getvalue()
+        # Only the most recently queued packet is withheld; the rest is a
+        # complete, EOS-free prefix of the finished stream.
+        self.assertTrue(to_ogg_opus(PACKET * 3).startswith(partial))
+        self.assertFalse(any(page[5] & 4 for page in pages(partial)))
+        writer.finish()
+        with self.assertRaises(ValueError):
+            writer.write_packet(PACKET)
+        writer.finish()  # idempotent
+        self.assertEqual(output.getvalue(), to_ogg_opus(PACKET * 3))
+
+    def test_writer_rejects_non_80_byte_packets(self):
+        writer = OggOpusWriter(io.BytesIO())
+        for packet in (b"", PACKET[:-1], PACKET + b"\0"):
+            with self.assertRaises(ValueError):
+                writer.write_packet(packet)
 
     def test_truncated_final_packet_invalid_toc_is_rejected(self):
         for tail in (b"\x4c" + b"\0" * 47, b"\x4b\x3f" + b"\0" * 46,

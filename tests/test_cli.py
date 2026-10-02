@@ -1,3 +1,5 @@
+import asyncio
+import io
 import json
 import os
 import tempfile
@@ -7,7 +9,8 @@ from datetime import datetime
 from io import StringIO
 from unittest.mock import AsyncMock, patch
 
-from airec import DownloadInterrupted, Recording, Recorder, RecordingStatus, StorageInfo
+from airec import (DownloadInterrupted, OggOpusWriter, ProtocolError, Recording,
+                   Recorder, RecordingStatus, StorageInfo, to_ogg_opus)
 from airec.__main__ import _select_device, main
 from airec.report import human_size, render_text
 
@@ -459,6 +462,174 @@ class SyncCommandTests(unittest.TestCase):
         self.assertEqual(code, 0)
         client.delete_recording.assert_awaited_once_with("20260101120000")
         self.assertIn("Deleted 20260101120000 from recorder", output)
+
+
+class ListenCommandTests(unittest.TestCase):
+    """Live-audio streaming to a file or stdout against a fake live_audio()."""
+
+    # Config 9 (SILK wideband, 16 kHz), mono, code 3 with a one-frame count byte.
+    PACKET = b"\x4b\x41" + b"\x00" * 78
+
+    def _client(self, packets):
+        async def stream():
+            for packet in packets:
+                yield packet
+        return _FakeClient(live_audio=stream)
+
+    def _help(self, *argv):
+        output = StringIO()
+        with patch("sys.argv", ["airec", *argv]), redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                main()
+        return output.getvalue()
+
+    def test_listen_writes_playable_file_and_summary_to_stderr(self):
+        packets = [self.PACKET] * 50
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "live.opus")
+            code, output, error = _run(["listen", "-o", destination],
+                                       client=self._client(packets))
+            with open(destination, "rb") as handle:
+                written = handle.read()
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertEqual(written, to_ogg_opus(self.PACKET * 50))
+        self.assertIn("50 packets", error)
+        self.assertIn("1.0 s", error)
+        self.assertIn("stream ended", error)
+
+    def test_listen_dash_puts_only_audio_on_stdout(self):
+        stream = io.BytesIO()
+        packets = [self.PACKET] * 5
+        with patch("airec.__main__._binary_stdout", return_value=stream):
+            code, output, error = _run(["listen", "-o", "-"], client=self._client(packets))
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertEqual(stream.getvalue(), to_ogg_opus(self.PACKET * 5))
+        self.assertIn("5 packets", error)
+
+    def test_listen_interrupt_finishes_the_file(self):
+        async def interrupted():
+            for packet in [self.PACKET] * 4:
+                yield packet
+            raise asyncio.CancelledError
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "live.opus")
+            code, _, error = _run(["listen", "-o", destination],
+                                  client=_FakeClient(live_audio=interrupted))
+            with open(destination, "rb") as handle:
+                written = handle.read()
+        self.assertEqual(code, 0)
+        self.assertEqual(written, to_ogg_opus(self.PACKET * 4))
+        self.assertIn("interrupted", error)
+        # The summary is newline-terminated, so an interactive shell's missing-
+        # newline marker after Ctrl-C is the terminal's ^C echo, not our output.
+        self.assertTrue(error.endswith("interrupted.\n"))
+
+    def test_listen_error_keeps_flushed_prefix_and_exits_nonzero(self):
+        async def failing():
+            for packet in [self.PACKET] * 3:
+                yield packet
+            raise ProtocolError("stream broke")
+
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "live.opus")
+            code, output, error = _run(["listen", "-o", destination],
+                                       client=_FakeClient(live_audio=failing))
+            with open(destination, "rb") as handle:
+                written = handle.read()
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("ProtocolError", error)
+        self.assertIn("stream broke", error)
+        # No EOS page on error: the last queued packet is withheld, as documented.
+        buffer = io.BytesIO()
+        expected = OggOpusWriter(buffer)
+        for _ in range(3):
+            expected.write_packet(self.PACKET)
+        self.assertEqual(written, buffer.getvalue())
+
+    def test_listen_broken_pipe_ends_quietly(self):
+        class _ClosedPipe(io.BytesIO):
+            def __init__(self):
+                super().__init__()
+                self.flushes = 0
+
+            def flush(self):
+                self.flushes += 1
+                if self.flushes > 1:
+                    raise BrokenPipeError("player closed")
+                super().flush()
+
+        stream = _ClosedPipe()
+        with patch("airec.__main__._binary_stdout", return_value=stream):
+            code, output, error = _run(["listen", "-o", "-"],
+                                       client=self._client([self.PACKET] * 5))
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertIn("output closed", error)
+
+    def test_listen_broken_pipe_on_the_first_write_ends_quietly(self):
+        class _BrokenOnWrite(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError("player closed")
+
+        stream = _BrokenOnWrite()
+        with patch("airec.__main__._binary_stdout", return_value=stream):
+            code, output, error = _run(["listen", "-o", "-"],
+                                       client=self._client([self.PACKET] * 5))
+        # The header write happens inside the protected block, so the break is
+        # handled quietly instead of escaping from the writer construction.
+        self.assertEqual(code, 0)
+        self.assertEqual(output, "")
+        self.assertIn("output closed", error)
+        self.assertIn("0 packets", error)
+
+    def test_listen_first_write_break_closes_the_opened_file(self):
+        class _BrokenOnWrite(io.BytesIO):
+            def write(self, data):
+                raise BrokenPipeError("player closed")
+
+        target = _BrokenOnWrite()
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "live.opus")
+            with patch("builtins.open", return_value=target):
+                code, _, error = _run(["listen", "-o", destination],
+                                      client=self._client([self.PACKET] * 5))
+        self.assertEqual(code, 0)
+        self.assertTrue(target.closed)
+        self.assertIn("output closed", error)
+
+    def test_listen_refuses_existing_file_without_connecting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "live.opus")
+            with open(destination, "wb") as handle:
+                handle.write(b"prior contents")
+            output, error = StringIO(), StringIO()
+            with patch("sys.argv", ["airec", "listen", "-o", destination]), \
+                    patch("airec.__main__._select_device", new=AsyncMock()) as select, \
+                    patch("airec.__main__.find_recorders", new=AsyncMock()) as scan, \
+                    redirect_stdout(output), redirect_stderr(error):
+                code = main()
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), b"prior contents")
+        self.assertEqual(code, 1)
+        self.assertIn("refusing to overwrite", error.getvalue())
+        select.assert_not_awaited()
+        scan.assert_not_awaited()
+
+    def test_listen_rejects_json(self):
+        code, output, error = _run(["--json", "listen", "-o", "-"],
+                                   client=self._client([self.PACKET]))
+        self.assertEqual(code, 1)
+        self.assertEqual(output, "")
+        self.assertIn("--json", error)
+
+    def test_listen_help_describes_stderr_and_exclusive_output(self):
+        help_text = self._help("listen", "--help")
+        self.assertIn("--output", help_text)
+        self.assertIn("stderr", help_text)
 
 
 class GlobalOptionPlacementTests(unittest.TestCase):

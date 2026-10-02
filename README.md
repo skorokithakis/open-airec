@@ -34,9 +34,10 @@ not tested. They may work, but nobody has checked yet.
 | Download recordings as Ogg Opus audio (or raw) | Yes |
 | Sync every recording into a folder, resuming interrupted transfers | Yes |
 | Start, pause, resume and stop recording | Yes |
+| Listen to live audio | Yes, experimental |
 | Delete one recording | Yes |
 | Read and set the recorder's clock | Yes |
-| Wi-Fi transfer, live audio | No |
+| Wi-Fi transfer | No |
 | Firmware updates, reset, format, erase all | No, on purpose |
 
 For the full list, see [limitations](docs/limitations.md).
@@ -183,6 +184,35 @@ paused recording. For many pause and resume steps in a row, use the
 
 The recorder can discard very short recordings by itself, even after `stop`
 reports success.
+
+### Listen to live audio
+
+```bash
+airec listen -o live.opus          # save the live audio to a new file
+airec listen -o - | ffplay -nodisp -
+airec listen -o - | mpv -
+```
+
+`listen` streams what the recorder is capturing right now as Ogg Opus. The
+recorder must already be recording; `listen` does not start one. It stops by
+itself when the recording ends or when the recorder splits it into a new
+segment, and you can stop it early with Ctrl-C. The file stays playable either
+way.
+
+- `-o FILE` writes to a new file and refuses to replace one that already
+  exists.
+- `-o -` writes the audio to standard output, so you can pipe it straight into
+  a player as shown above.
+- A short summary (duration, packet count and why it ended) is printed to
+  standard error. With `-o -`, standard output carries only audio, so the
+  summary cannot corrupt the stream. `--json` is not supported for `listen` for
+  the same reason.
+
+`listen` has no built-in player; it writes an Ogg Opus stream and relies on the
+player you pipe it to. While it is running it holds the connection and the
+recorder stops advertising, so a second `airec` command cannot find it; run any
+other `airec` commands afterwards. It needs an active recording and the fixed
+80-byte mono Opus profile.
 
 ### Delete a recording
 

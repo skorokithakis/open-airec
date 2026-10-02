@@ -6,7 +6,7 @@ vendor specification. Use UUIDs, not ATT handles (which vary).
 | Role | UUID |
 | --- | --- |
 | Primary service | `0011200a-2233-4455-6677-8899dfdedddc` |
-| Live notifications (not implemented) | `0011201a-2233-4455-6677-8899dfdedddc` |
+| Live notifications (`live_audio`, experimental) | `0011201a-2233-4455-6677-8899dfdedddc` |
 | Control write without response | `0011202a-2233-4455-6677-8899dfdedddc` |
 | Control notifications | `0011203a-2233-4455-6677-8899dfdedddc` |
 | Archive data notifications | `0011204a-2233-4455-6677-8899dfdedddc` |
@@ -107,10 +107,14 @@ Wi-Fi AP name. `0x64` is excluded because it returns credentials.
 
 During recording the device can also emit `0x36` and `0x3b` unsolicited; `0x3b`
 carries a two-byte value, likely elapsed seconds (unconfirmed). A caller must not
-treat an unsolicited `0x36` as the reply to its own query. Other device-originated
-frames identified from the app are `0x1a`/`0x1b`/`0x1c` (device-button recording),
-`0x35`, `0x37` (shutdown reminder), `0x3d` (call state) and the one-key events
-`0x31`-`0x33`/`0x41`-`0x43`.
+treat an unsolicited `0x36` as the reply to its own query. The L3 live probe
+(2026-10-02) also observed device-originated `0x03` on a button start (carrying
+the new recording ID, not `0x1a`/`0x1b`) and an unsolicited `0x04` on button stop
+(ID + four-byte size, about 1.3 s after the last live-audio byte). Both end
+`live_audio()` cleanly; neither is a reply to a client request. Other
+device-originated frames identified from the app are `0x1a`/`0x1b`/`0x1c`
+(device-button recording), `0x35`, `0x37` (shutdown reminder), `0x3d` (call
+state) and the one-key events `0x31`-`0x33`/`0x41`-`0x43`.
 
 ## Settings setters
 
@@ -238,6 +242,28 @@ Linux/Bleak 0.22 downloads isolate the private BlueZ AcquireWrite MTU workaround
 the default/stale characteristic limit may be 20 despite negotiated MTU 247. A
 download request is 22 bytes. The write path splits logical requests to its known
 payload limit; no hard-coded ATT handle or write-with-response fallback is used.
+
+## Live audio
+
+`0011201a` carries a continuous, boundary-free raw byte stream while a recording
+is active. `0x6d` is not required to start it; the L2 probe saw it active with no
+`0x6d`, and it is silent while stopped and while paused. Concatenate the
+notifications and align at the first offset whose TOCs at `k`, `k+80` and `k+160`
+are config 9 (SILK wideband, 16 kHz) and mono, then cut every 80 bytes. This is
+the `fixedKA80` profile; the L3 probe observed alignment offsets 0/32/16/0 after
+resubscribes, always with a single candidate, so alignment must be re-derived
+after each subscribe. Any later packet that fails the same check is an error with
+no resync.
+
+`0x3b` ticks (~5 Hz, big-endian elapsed seconds) continue while recording and
+stop while paused; it counts as stream activity. A button stop sends an
+unsolicited `0x04` (ID + four-byte size) about 1.3 s after the last 1a byte and
+no 1a follows, so it ends a stream cleanly; a final slot shorter than 80 bytes is
+dropped. A button start sends an unsolicited `0x03` with the new ID, which also
+ends a stream (segment rollover). The client also ends a stream after a silent
+window (no 1a and no `0x3b`) when one `0x0f` query reports stopped, and raises
+otherwise. Live audio must never be fed to the control decoder or the trace
+callback. See [live-audio.md](live-audio.md).
 
 ## Audio
 

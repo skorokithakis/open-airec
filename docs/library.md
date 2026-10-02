@@ -177,11 +177,55 @@ and an invalid trailing TOC raise `ValueError`. Full packets are preserved
 bit-for-bit. Up to 79 trailing raw bytes can be left out of the wrapped audio.
 `format="raw"` keeps every byte.
 
+`OggOpusWriter(output)` writes the same stream incrementally for live audio.
+The `OpusHead`/`OpusTags` pages are written on construction; each
+`write_packet(packet)` takes one exactly-80-byte packet and flushes the previous
+one as its own page with a running granule/sequence; `finish()` marks the queued
+page as end-of-stream. If the process is cut off (for example Ctrl-C) before
+`finish()`, the flushed pages still form a valid, EOS-free Ogg stream; only the
+most recently queued packet is withheld. Writing after `finish()` raises
+`ValueError`.
+
 `save_audio(raw, destination, *, format="opus") -> pathlib.Path` converts to Ogg
 Opus or preserves bytes with `format="raw"`. It writes/fsyncs a sibling temporary
 file, hard-links atomically into place, and removes the temporary file. Parent
 directory must exist. Existing files/symlinks raise `FileExistsError`; disk and
 filesystem errors propagate. Publication does not claim directory-fsync durability.
+
+## Live audio streaming
+
+`async for packet in recorder.live_audio():` yields aligned 80-byte mono Opus
+packets from the `0011201a` live characteristic. It requires an already-active
+recording: `0x0f` must report `recording`, otherwise `ProtocolError` is raised
+before subscribing. A stopped or paused recorder is a caller error, not an
+`ActiveRecordingError` (which belongs to archive download).
+
+```python
+async with AirecClient(device) as recorder:
+    await recorder.start_recording()
+    writer = OggOpusWriter(output_file)
+    async for packet in recorder.live_audio():
+        writer.write_packet(packet)
+    writer.finish()
+```
+
+- The 1a notifications are a boundary-free byte stream. The first offset whose
+  TOCs at `k`, `k+80` and `k+160` are the config-9 (SILK wideband, 16 kHz) mono
+  profile is the stream start; every later packet must keep passing the same
+  check or `ProtocolError` is raised. There is no resync, PCM or other-profile
+  support. A stream that ends before 320 bytes (about 80 ms) yields no packets.
+- The iterator holds the client lock for the whole stream, so no other client
+  operation can run concurrently. It never sends `0x03`, `0x04`, `0x6d` or
+  `0x6e`, and live audio is never passed to the `trace` callback.
+- It ends cleanly on an unsolicited `0x04` (button stop/finalize), an unsolicited
+  `0x03` (segment rollover / new recording), or after the client timeout with no
+  1a bytes and no `0x3b` ticks when one `0x0f` reports stopped. A partial final
+  packet is dropped, like an archive's truncated tail. Silence in any other state
+  raises `TimeoutError`.
+- Closing early stops the subscription and releases the lock. Use
+  `contextlib.aclosing` (or an explicit `aclose`) for a deterministic exit; a
+  bare `break` from `async for` only closes the async generator when it is
+  finalized.
 
 ## Bulk sync
 

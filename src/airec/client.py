@@ -1,7 +1,8 @@
 """Narrow experimental client for the app's primary UUID profile.
 
-Queries, recording controls, single-file deletion, clock setting and the
-hardware-confirmed single-value settings writes are exposed. OTA, reset and disk
+Queries, recording controls, single-file deletion, clock setting, the
+hardware-confirmed single-value settings writes and the experimental live audio
+stream are exposed. OTA, reset and disk
 formatting are deliberately absent.
 Validated on one recorder, not all models.
 """
@@ -9,6 +10,7 @@ Validated on one recorder, not all models.
 import asyncio
 import logging
 import math
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from datetime import datetime
 from contextlib import asynccontextmanager
@@ -16,12 +18,37 @@ from typing import Callable, NamedTuple
 
 from bleak import BleakClient
 
+from .audio import _packet_samples
 from .framing import Frame, FrameDecoder, encode_request
 
 SERVICE = "0011200a-2233-4455-6677-8899dfdedddc"
+LIVE_NOTIFY = "0011201a-2233-4455-6677-8899dfdedddc"
 CONTROL_WRITE = "0011202a-2233-4455-6677-8899dfdedddc"
 CONTROL_NOTIFY = "0011203a-2233-4455-6677-8899dfdedddc"
 ARCHIVE_NOTIFY = "0011204a-2233-4455-6677-8899dfdedddc"
+
+# Live 1a framing is the fixedKA80 profile: a boundary-free byte stream cut into
+# 80-byte packets, each starting with a config-9 (SILK wideband, 16 kHz) mono
+# Opus TOC. Alignment checks all offsets in one packet period once four slots
+# are buffered, so offset 79 has its three TOCs available. See live-audio.md L3.
+_LIVE_PACKET = 80
+_LIVE_CONFIG = 9
+_LIVE_ALIGN_BYTES = 4 * _LIVE_PACKET
+
+
+def _live_packet_valid(packet: bytes) -> bool:
+    """One 80-byte live packet: config 9, mono, valid Opus duration.
+
+    Reuses the archive wrapper's TOC timing/duration check. Unlike the archive
+    path, this live profile rejects every config other than 9 (no resync).
+    """
+    if (packet[0] >> 3) != _LIVE_CONFIG or packet[0] & 0x04:
+        return False
+    try:
+        _packet_samples(packet)
+    except (ValueError, IndexError):
+        return False
+    return True
 
 
 def _validate_recording_id(value: str) -> bytes:
@@ -291,6 +318,7 @@ class AirecClient:
         self._expected: set[int] = set()
         self._bulk_subscribed = False
         self._download_active = False
+        self._live_active = False
         self._control_write_limit = 20
         self.mac_response: bytes | None = None
 
@@ -311,14 +339,23 @@ class AirecClient:
                 break
             self._responses.put_nowait(frame)
 
-    def _audio_notification(self, _characteristic, data):
+    def _queue_audio(self, data):
         # Audio is never sent to the control trace callback.
-        if not self._download_active:
-            return
         if self._responses.full():
             self._overflow = True
         else:
             self._responses.put_nowait(bytes(data))
+
+    def _archive_notification(self, _characteristic, data):
+        # Gated only by the archive flag: a live subscription that outlives its
+        # cleanup must not leak bytes into a later download.
+        if self._download_active:
+            self._queue_audio(data)
+
+    def _live_notification(self, _characteristic, data):
+        # Gated only by the live flag, for the same reason in reverse.
+        if self._live_active:
+            self._queue_audio(data)
 
     async def __aenter__(self):
         await self.connect()
@@ -341,6 +378,7 @@ class AirecClient:
             self.mac_response = None
             self._bulk_subscribed = False
             self._download_active = False
+            self._live_active = False
             self._decoder.reset()
             self._overflow = False
             self._drain()
@@ -382,6 +420,7 @@ class AirecClient:
             self.mac_response = None
             self._expected.clear()
             self._download_active = False
+            self._live_active = False
             await self._client.disconnect()
 
     def _drain(self):
@@ -809,7 +848,7 @@ class AirecClient:
                         bulk = service.get_characteristic(ARCHIVE_NOTIFY)
                         if bulk is None or "notify" not in bulk.properties:
                             raise ProtocolError("archive notification characteristic is missing")
-                        await self._client.start_notify(bulk, self._audio_notification)
+                        await self._client.start_notify(bulk, self._archive_notification)
                         self._bulk_subscribed = True
                     self._download_active = True
                     started = True
@@ -871,6 +910,154 @@ class AirecClient:
             finally:
                 self._download_active = False
                 self._expected.clear()
+
+    @staticmethod
+    def _live_alignment(buffer: bytearray) -> int | None:
+        """First offset whose three consecutive 80-byte slots are valid packets.
+
+        Every phase in one packet period is checkable once four slots (320 bytes)
+        are buffered, so a single pass is conclusive. ``None`` means no offset is
+        valid yet (or at all).
+        """
+        if len(buffer) < _LIVE_ALIGN_BYTES:
+            return None
+        for offset in range(_LIVE_PACKET):
+            if all(_live_packet_valid(bytes(buffer[offset + index * _LIVE_PACKET:
+                                                  offset + (index + 1) * _LIVE_PACKET]))
+                   for index in range(3)):
+                return offset
+        return None
+
+    async def _live_silence(self) -> None:
+        """Query status once after a silent window; return only when stopped.
+
+        A stopped recorder ends the stream cleanly. Any other state (including
+        paused, which only this client can cause while it holds the lock) is an
+        unexpected silence and raises TimeoutError.
+        """
+        async with asyncio.timeout(self.timeout):
+            await self._write(15)
+            frame = await self._receive(15)
+        if self._status_code(frame) != 2:
+            raise TimeoutError("live audio produced no data within the timeout")
+
+    async def live_audio(self) -> AsyncIterator[bytes]:
+        """Yield aligned 80-byte mono Opus packets from the live 1a stream.
+
+        Requires an already-active recording; a stopped or paused recorder raises
+        ``ProtocolError`` before the 1a characteristic is subscribed. Holds the
+        client lock for the whole stream, so no other operation runs concurrently.
+        Never sends 0x03, 0x04, 0x6d or 0x6e. Audio is never traced.
+
+        The 1a notifications are a boundary-free byte stream. Alignment picks the
+        first offset whose TOCs at ``k``, ``k+80`` and ``k+160`` are the config-9
+        (SILK wideband, 16 kHz) mono profile; every later 80-byte packet must keep
+        passing the same check or ``ProtocolError`` is raised (no resync). A
+        stream that ends before 320 bytes (about 80 ms) yields no packets.
+
+        A partial trailing packet is dropped, like an archive's truncated tail.
+
+        The iterator ends cleanly on an unsolicited ``0x04`` (button stop), an
+        unsolicited ``0x03`` (segment rollover / new recording), or when both 1a
+        and ``0x3b`` have been silent for the client timeout and one ``0x0f``
+        reports stopped. Silence in any other state raises ``TimeoutError``.
+        Closing early (``aclose``/``contextlib.aclosing``/cancellation)
+        unsubscribes 1a and releases the lock. A bare ``break`` from ``async for``
+        only closes the generator on finalization, so use ``aclosing`` for a
+        deterministic exit.
+        """
+        async with self._lock:
+            self._require_ready()
+            self._drain()
+            self._expected = {15, 3, 4, 0x3B}
+            loop = asyncio.get_running_loop()
+            live = None
+            attempted = False
+            try:
+                async with asyncio.timeout(self.timeout):
+                    await self._write(15)
+                    status = self._status_code(await self._receive(15))
+                if status != 0:
+                    raise ProtocolError("live audio requires an active recording")
+                service = self._client.services.get_service(SERVICE)
+                live = service.get_characteristic(LIVE_NOTIFY)
+                if live is None or "notify" not in live.properties:
+                    raise ProtocolError("live audio notification characteristic is missing")
+                # Accept 1a bytes before start_notify returns so no notification
+                # can be lost between subscribing and arming the callback. Mark
+                # the attempt first so a cancelled/failed start still unsubscribes.
+                self._live_active = True
+                attempted = True
+                await self._client.start_notify(live, self._live_notification)
+                last_activity = loop.time()
+                buffer = bytearray()
+                aligned = False
+                while True:
+                    if self._overflow:
+                        raise ProtocolError("live audio queue overflow; stream is incomplete")
+                    if not self._client.is_connected:
+                        raise ConnectionError("recorder disconnected during live audio")
+                    if not self._responses.empty():
+                        event = self._responses.get_nowait()
+                    else:
+                        remaining = last_activity + self.timeout - loop.time()
+                        if remaining <= 0:
+                            await self._live_silence()
+                            return
+                        try:
+                            async with asyncio.timeout(remaining):
+                                event = await self._responses.get()
+                        except TimeoutError:
+                            continue
+                    if event is None:
+                        raise ConnectionError("recorder disconnected during live audio")
+                    if isinstance(event, bytes):
+                        last_activity = loop.time()
+                        buffer.extend(event)
+                        if not aligned:
+                            offset = self._live_alignment(buffer)
+                            if offset is None:
+                                if len(buffer) < _LIVE_ALIGN_BYTES:
+                                    continue
+                                raise ProtocolError(
+                                    "live audio is not the config-9 80-byte Opus profile")
+                            del buffer[:offset]
+                            aligned = True
+                        while len(buffer) >= _LIVE_PACKET:
+                            packet = bytes(buffer[:_LIVE_PACKET])
+                            if not _live_packet_valid(packet):
+                                raise ProtocolError("live audio packet failed the Opus TOC check")
+                            del buffer[:_LIVE_PACKET]
+                            yield packet
+                    elif event.command in (3, 4):
+                        return
+                    elif event.command == 0x3B:
+                        last_activity = loop.time()
+            except (GeneratorExit, asyncio.CancelledError):
+                raise
+            except BaseException:
+                # A failed stream leaves the shared queue's contents unattributed;
+                # require a reconnect before reuse, as download_recording does.
+                self._ready = False
+                raise
+            finally:
+                try:
+                    if attempted and self._client.is_connected:
+                        await self._client.stop_notify(live)
+                except asyncio.CancelledError:
+                    # A live callback may still be armed; the next operation
+                    # cannot trust the shared queue, so require a reconnect.
+                    self._ready = False
+                    raise
+                except Exception:
+                    self._ready = False
+                    logging.getLogger(__name__).warning(
+                        "Unable to unsubscribe live audio", exc_info=True)
+                finally:
+                    self._live_active = False
+                    self._expected.clear()
+                    self._drain()
+                    self._overflow = False
 
     async def list_recordings(self) -> tuple[Recording, ...]:
         """Collect rows through the explicit end marker, without a pause toggle.

@@ -10,7 +10,7 @@ fake BLE transport and never accesses real hardware.
 ## Commands
 
 - Install: `.venv/bin/python -m pip install -e .`
-- Tests: `.venv/bin/python -m unittest discover -s tests -v` (103 tests at handoff)
+- Tests: `.venv/bin/python -m unittest discover -s tests -v` (210 tests at handoff)
 - Compile: `.venv/bin/python -m compileall -q src tests`
 - CLI: `.venv/bin/python -m airec --help` (text output by default, `--json` for
   scripts; recorder from --address, AIREC_ADDRESS, or a unique `AIREC*` name scan)

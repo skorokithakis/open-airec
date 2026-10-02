@@ -11,6 +11,11 @@ is fixed 80-byte Opus packets. See
 [L2 live probe](#l2-live-probe-hardware-2026-10-02) below; the original L1 text
 is preserved unchanged.
 
+L3 hardware update (2026-10-02): the end-of-stream probe ran for ticket
+`oa-mxhcc`, covering pause/resume, resubscribe alignment and button-stop timing.
+See [L3 live probe](#l3-live-probe-hardware-2026-10-02). The client behaviour
+derived from it is implemented on `AirecClient.live_audio()`.
+
 Sources, relative to the app's Blutter output `artifacts/re/out/asm/airec/`:
 
 - `airec_module/record/realtime/realtime_monitor_page.dart` (the "AIREC 实时听音"
@@ -320,6 +325,115 @@ State changes: the only writes were `55 aa 01 01` (identity, part of
 initialization) and a single read-only `55 aa 01 0f`. No `0x03`/`0x04`/`0x6d`/
 `0x6e`/`0x3c` or any other opcode was sent, and the active recording was left
 running for the user to stop with the button.
+
+## L3 live probe (hardware, 2026-10-02)
+
+Ticket `oa-mxhcc`, artifact
+`artifacts/re/probe_output/live_l3_20261002T094659Z.json` (counts/timings only,
+local; no audio hex, IDs or address is reproduced here). The recorder was
+controlled only by the status prompt and the button; the phone app was
+disconnected. Writes were the identity during initialization, read-only `0x0f`
+status polls and one `0x10` toggle each for pause and resume; the probe sent no
+`0x03`, `0x04`, `0x6d`, `0x6e` or other opcode.
+
+Method: initialize as the library client does, subscribe control `3a` and live
+`1a`, and record every notification with a monotonic host offset, length and
+payload. Phases: stopped baseline; button-start into recording; two
+unsubscribe/resubscribe cycles; pause; resume; button stop.
+
+Results:
+
+| Phase | Duration | 1a notifications | 1a bytes | Alignment |
+| --- | --- | --- | --- | --- |
+| stopped baseline | 10 s | 0 | 0 | — |
+| recording (button start) | 15 s | 269 | 55232 | offset 0 |
+| resubscribe 1 | 5 s | 100 | 20480 | offset 0 |
+| resubscribe 2 | 5 s | 95 | 19456 | offset 32 |
+| paused (`0x10`) | 15 s | 0 | 0 | — |
+| resumed (`0x10`) | 10 s | 195 | 39936 | offset 16 |
+| stop transition | — | 50 | 10240 | offset 0 |
+
+- **1a is silent while stopped and while paused.** The stopped baseline and the
+  paused phase produced no notifications. It resumes immediately after the
+  recording does.
+- **Alignment must be re-derived after each subscribe.** Alignment offsets seen
+  were 0, 32, 16 and 0 across the phases, and each phase had exactly one
+  candidate over a 400-byte window. Concatenating a phase still yields fixed
+  80-byte config-9 mono packets.
+- **`0x3b` is the recording activity tick.** It appeared only while recording
+  (~5 Hz over the session, paused during the pause phase) and stopped with the
+  recording. It is device-originated and carries a two-byte big-endian value
+  that rose by one per second (elapsed seconds), reconfirming L2.
+- **Button start is an unsolicited `0x03`.** The button-start transition
+  produced one unsolicited `0x03` carrying the new recording ID (14 ASCII
+  timestamp bytes); no `0x1a`/`0x1b` was seen, and the probe did not send it.
+- **Button stop is an unsolicited `0x04`.** The last 1a byte arrived at
+  t≈80.07 s, the polling `0x0f` first reported stopped at t≈80.91 s, and the
+  unsolicited `0x04` (ID + four-byte size) arrived at t≈81.36 s, about 1.29 s
+  after the last byte. No 1a notification followed the stop.
+- An unsolicited `0x36` power-state frame was also present; it is not a
+  live-audio event.
+
+Client consequences (implemented in `AirecClient.live_audio()`):
+
+- Preflight with `0x0f`; only `recording` starts a stream, so stopped/paused
+  raises `ProtocolError`.
+- End cleanly on unsolicited `0x04`, and on unsolicited `0x03` (the likely
+  first half of a segment rollover); drop a final partial 80-byte slot.
+- Treat `0x3b` as activity for the silence timer; on a silent window, query
+  `0x0f` once and end cleanly only when it reports stopped, otherwise raise
+  `TimeoutError`. Pause can only be caused by the lock-holding client, so no
+  paused-wait logic is needed.
+- Re-derive alignment on every subscribe (no resync after a bad packet).
+
+Known limit: segment rollover is accepted as an end of stream (0x04, then
+0x03), so a stream spanning segments does not continue automatically.
+
+## Live validation (airec listen, hardware, 2026-10-02)
+
+Ticket `oa-qniij`. Two runs of the shipped `airec listen -o FILE` against the
+recorder during a button-started recording, phone app disconnected and no
+existing archive changed. Run 1 was ended with Ctrl-C after 76.8 s; run 2 ended
+by itself when the recorder's button stop finalized the recording, after 23.3 s.
+The files stayed in `/tmp` and are not reproduced here; only container metadata
+was inspected with ffprobe/ffmpeg (already installed). No audio content is
+described.
+
+CONFIRMED:
+
+- **Ogg Opus, one channel (mono).** The Ogg stream reports the standard 48 kHz
+  Opus decode rate. Every audio page holds exactly one 80-byte packet, and every
+  packet's TOC is config 9 (SILK wideband, 16 kHz source) with the mono bit
+  clear (`0x4b` 3755x and `0x48` 84x in run 1; `0x4b` 1118x and `0x48` 46x in
+  run 2). The granule delta between consecutive audio pages is always `960`
+  samples (20 ms at 48 kHz).
+- **Duration matches the packet count exactly.** Run 1: 3839 packets x 20 ms =
+  76.78 s, ffprobe duration 76.78 s, final granule 3839 x 960 = 3685440.
+  Run 2: 1164 x 20 ms = 23.28 s, ffprobe duration 23.28 s, final granule
+  1164 x 960 = 1117440. The `_listen_summary` duration is therefore accurate.
+- **EOS is present in both files, including the Ctrl-C one.** Run 1 has 3841
+  pages (2 header + 3839 audio), run 2 has 1166 (2 header + 1164 audio), and in
+  both the final audio page carries the Ogg end-of-stream flag (`0x04`). So the
+  Ctrl-C path really does call `_finish_quietly`/`finish`, not only the clean
+  end path.
+- **Both files decode cleanly.** `ffmpeg -v error -i FILE -f null -` exits 0
+  with no output for both, and a forced 16 kHz mono decode (`-ar 16000 -ac 1`)
+  is also clean.
+
+Ending behaviour:
+
+- **Ctrl-C** printed `Listened 76.8 s (3839 packets); ended: interrupted.` and
+  left a valid EOS-terminated file.
+- **Button stop** ended the stream by itself with `ended: stream ended.` and a
+  clean process exit.
+- The fish `⏎` "missing newline" marker seen after Ctrl-C is the terminal's
+  `^C` echo, not command output: `_listen` prints the summary with `print()` and
+  a captured run's stderr ends in a newline. No code change was needed.
+
+Single connection at a time (CONFIRMED): while an `airec listen` process holds
+the BLE link, the recorder stops advertising, so a second CLI command either
+scans and finds no recorder or, with `--address`, reports that the selected
+recorder is not advertising. Run other `airec` commands after `listen` exits.
 
 ## Evidence index
 

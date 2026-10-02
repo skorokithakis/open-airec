@@ -5,7 +5,7 @@
 | Feature | Evidence and remaining work |
 | --- | --- |
 | Wi-Fi fast transfer | App contains hotspot control and TCP/UDP transfer paths. This recorder's Wi-Fi support has not been confirmed. Needs capability detection, setup, network protocol recovery and controlled validation. |
-| Live audio stream | A live notify characteristic exists, but there is no public subscription/stream API or validated decoding path for it. |
+| Live audio stream | `airec listen` and `AirecClient.live_audio()` stream the live notify characteristic as fixed 80-byte config-9 mono Opus packets (`OggOpusWriter`/`airec listen` wrap them in Ogg Opus). An active recording is required; the stream ends on stop, button start (segment rollover) or a silent-stopped window. No PCM/other-profile decoding, no resync and no built-in playback. |
 | Other device settings | `airec info` and `device_settings()` read the recorder's current settings, but there are no setters: recording modes, segmentation, gains and similar settings cannot be changed. Only ordinary recording mode is supported. |
 | Address tracking and device picker | `airec scan` and `find_recorders()` match advertised names that start with `AIREC`. The CLI selects a recorder automatically only when exactly one matches. There is no interactive picker and no tracking of addresses that change. The name prefix was checked against one user's recorder only. |
 | Recording duration metadata | Catalog contains time and byte size, not a decoded duration. Opus timing is computed only when wrapping the supported archive profile. |
