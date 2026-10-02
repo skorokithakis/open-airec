@@ -222,7 +222,3 @@ recordings/
 
 # Private device evidence and non-distributable reverse-engineering inputs
 /artifacts/
-*.apk
-/airec-0.1.0/
-/airec-0.1.0.tar.gz
-/AIREC+-++Voice+Transcription_2.1.3_APKPure/

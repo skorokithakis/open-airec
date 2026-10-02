@@ -1,5 +1,13 @@
 # airec
 
+<p align="center">
+  <img src="misc/recorder.png" alt="The AIREC voice recorder" width="300">
+</p>
+
+This project is for the AIREC voice recorder, the small card-sized Bluetooth
+recorder in the picture above. It is an unofficial, open-source alternative to
+the manufacturer's phone app.
+
 Control an AIREC voice recorder from your computer over Bluetooth. List your
 recordings, download them as playable audio files, start and stop recording,
 and set the recorder's clock. You do not need an account, the phone app or an
