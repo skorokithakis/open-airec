@@ -12,5 +12,8 @@ Read them before you change anything in `src/airec/client.py`.
   downloads, audio packaging, storage values and timestamps.
 
 The raw research material (the APK, decompiled code, packet captures and
-session logs) is not in this repository. The findings above replace it. See
+session logs) is not distributed with this repository; a 2.1.3 snapshot and its
+locally rebuilt Blutter output live under ignored `artifacts/re/`. The findings
+above replace the raw material for normal use, but new commands need a compatible
+snapshot again. See
 [retained versus removed material](app-analysis.md#retained-versus-removed-material).

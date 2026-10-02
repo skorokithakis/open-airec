@@ -9,6 +9,9 @@ from airec.audio import _packet_samples
 
 
 PACKET = b"\x48" + b"\0" * 79
+# Real firmware-truncated final slot: TOC 0x4b, frame count 0x41, padding
+# length 0x47, then padding to 48 bytes.
+TRUNCATED_TAIL = b"\x4b\x41\x47" + b"\0" * 45
 
 
 def pages(data):
@@ -57,6 +60,32 @@ class AudioTests(unittest.TestCase):
                      b"\x4b\x00" + PACKET[2:], b"\x4b\x3f" + PACKET[2:]):
             with self.assertRaises(ValueError):
                 to_ogg_opus(data)
+
+    def test_aligned_input_is_unchanged(self):
+        result = list(pages(to_ogg_opus(PACKET * 4)))
+        self.assertEqual(result[-1][5], 4)
+        self.assertEqual(b"".join(page[28:] for page in result[2:]), PACKET * 4)
+
+    def test_truncated_final_packet_is_dropped(self):
+        self.assertEqual(len(TRUNCATED_TAIL), 48)
+        self.assertEqual(to_ogg_opus(PACKET * 3 + TRUNCATED_TAIL),
+                         to_ogg_opus(PACKET * 3))
+
+    def test_truncated_final_packet_invalid_toc_is_rejected(self):
+        for tail in (b"\x4c" + b"\0" * 47, b"\x4b\x3f" + b"\0" * 46,
+                     b"\x4b\x00" + b"\0" * 46, b"\x4b"):
+            with self.assertRaises(ValueError):
+                to_ogg_opus(PACKET * 2 + tail)
+
+    def test_only_truncated_final_packet_is_rejected(self):
+        with self.assertRaises(ValueError):
+            to_ogg_opus(TRUNCATED_TAIL)
+
+    def test_raw_format_preserves_truncated_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "recording.airec"
+            save_audio(PACKET * 2 + TRUNCATED_TAIL, path, format="raw")
+            self.assertEqual(path.read_bytes(), PACKET * 2 + TRUNCATED_TAIL)
 
     def test_atomic_output_and_no_overwrite(self):
         with tempfile.TemporaryDirectory() as directory:

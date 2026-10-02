@@ -10,10 +10,12 @@ from dataclasses import asdict
 
 from bleak import BleakScanner
 
-from . import AirecClient, save_audio
-from .client import _validate_recording_id
-from .report import render_json, render_text
+from . import AirecClient
+from .client import DownloadInterrupted, _validate_recording_id
+from .report import render_json, render_sync_event, render_text
 from .scan import find_recorders
+from .sync import (SyncFailed, sync_directory, _DEFAULT_DOWNLOAD_TIMEOUT,
+                   _download_with_resume)
 
 
 async def _select_device(address, timeout):
@@ -45,6 +47,27 @@ def _emit(command, payload, as_json):
         print(render_text(command, payload))
 
 
+async def _info_payload(client):
+    """Collect every read-only info query; one failure aborts the whole command."""
+    version = await client.firmware_version()
+    firmware_type = await client.firmware_type()
+    chip = await client.chip_info()
+    charging = await client.is_charging()
+    settings = await client.device_settings()
+    return {
+        "firmware_version": version,
+        "firmware_type": firmware_type,
+        "chip_info": {
+            "work_mode": chip.work_mode,
+            "work_mode_name": chip.work_mode_name,
+            "audio_format": chip.audio_format,
+            "audio_format_name": chip.audio_format_name,
+        },
+        "is_charging": charging,
+        "device_settings": {**asdict(settings), "raw": settings.raw.hex()},
+    }
+
+
 _CONTROL_METHODS = {"status": "recording_status", "start": "start_recording",
                     "pause": "pause_recording", "resume": "resume_recording",
                     "stop": "stop_recording"}
@@ -62,6 +85,10 @@ async def run(args):
         _validate_recording_id(args.recording_id)
         suffix = ".opus" if args.format == "opus" else ".airec"
         destination = args.output or Path("recordings") / (args.recording_id + suffix)
+        scratch = destination.parent / f"{args.recording_id}.part"
+        if destination.resolve() == scratch.resolve():
+            raise ValueError(
+                f"output path is reserved for the download scratch file: {scratch.name}")
         if destination.exists() or destination.is_symlink():
             raise FileExistsError(f"refusing to overwrite {destination}")
         destination.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +96,8 @@ async def run(args):
         _validate_recording_id(args.recording_id)
         if not args.yes:
             raise ValueError("deletion is permanent; pass --yes to confirm")
+    if command == "sync" and args.delete_after and not args.yes:
+        raise ValueError("deletion is permanent; pass --yes to confirm")
     clock_value = None
     if command == "set-clock" and args.time:
         clock_value = datetime.fromisoformat(args.time)
@@ -91,14 +120,47 @@ async def run(args):
         elif command in ("clock", "set-clock"):
             value = await client.set_clock(clock_value) if command == "set-clock" else await client.clock()
             payload = {"device_local_time": value.isoformat()}
+        elif command == "info":
+            payload = await _info_payload(client)
         elif command == "download":
-            audio = await client.download_recording(
-                args.recording_id, timeout=args.download_timeout,
-                stop_if_recording=args.stop_recording,
-            )
-            save_audio(audio, destination, format=args.format)
+            matches = [row for row in await client.list_recordings()
+                       if row.recording_id == args.recording_id]
+            if len(matches) != 1:
+                raise ValueError("recording ID is absent or ambiguous in the catalog")
+            recording = matches[0]
+            part = destination.parent / f"{args.recording_id}.part"
+            try:
+                transferred, resumed_from = await _download_with_resume(
+                    client, recording, part, destination, format=args.format,
+                    timeout=args.download_timeout, stop_if_recording=args.stop_recording)
+            except DownloadInterrupted as exc:
+                raise RuntimeError(
+                    "download interrupted; rerun the same command to resume "
+                    f"({type(exc).__name__}: {exc})") from exc
             payload = {"recording_id": args.recording_id, "path": str(destination),
-                       "raw_size_bytes": len(audio), "file_size_bytes": destination.stat().st_size}
+                       "raw_size_bytes": recording.size_bytes,
+                       "file_size_bytes": destination.stat().st_size,
+                       "resumed_from": resumed_from or None, "bytes": transferred}
+        elif command == "sync":
+            def progress(event):
+                if not args.json:
+                    print(render_sync_event(asdict(event)))
+            try:
+                events = await sync_directory(
+                    client, args.directory, format=args.format,
+                    stop_recording=args.stop_recording, delete_after=args.delete_after,
+                    download_timeout=args.download_timeout, progress=progress,
+                )
+            except SyncFailed as exc:
+                # JSON consumers still get a structured record of what was done
+                # before the run stopped; text mode keeps its stderr report.
+                if args.json:
+                    _emit(command, {"directory": str(args.directory), "format": args.format,
+                                    "events": [asdict(event) for event in exc.events],
+                                    "error": str(exc)}, True)
+                raise
+            payload = {"directory": str(args.directory), "format": args.format,
+                       "events": [asdict(event) for event in events]}
         else:
             battery = await client.battery()
             recordings = await client.list_recordings()
@@ -141,6 +203,8 @@ def main():
     commands.add_parser("list", parents=[command_options], help="list recording metadata (the default)")
     commands.add_parser("storage", parents=[command_options],
                         help="read total, free and used storage in device-reported MB")
+    commands.add_parser("info", parents=[command_options],
+                        help="read firmware, chip, charging and device settings from the recorder")
     for name, help_text in (("status", "read recording state"), ("start", "start ordinary recording"),
                             ("pause", "pause active recording"), ("resume", "resume paused recording"),
                             ("stop", "stop/finalize current recording"), ("clock", "read device clock")):
@@ -156,10 +220,26 @@ def main():
                                    help="download one recording; never deletes it")
     download.add_argument("recording_id", help="14-digit ID from the catalog")
     download.add_argument("--output", type=Path, help="destination (default: recordings/ID.opus)")
-    download.add_argument("--format", choices=("opus", "raw"), default="opus")
-    download.add_argument("--download-timeout", type=float, default=120.0)
+    download.add_argument("--format", choices=("opus", "raw"), default="opus",
+                          help="output audio format: opus (default) or raw device bytes")
+    download.add_argument("--download-timeout", type=float, default=_DEFAULT_DOWNLOAD_TIMEOUT,
+                          help="seconds allowed for the transfer; default covers a full "
+                               "60-minute segment")
     download.add_argument("--stop-recording", action="store_true",
                           help="allow stopping/finalizing an active or paused recording; does not restart it")
+    sync = commands.add_parser("sync", parents=[command_options],
+                               help="download every missing recording into a directory, resuming partial files")
+    sync.add_argument("directory", type=Path, help="existing directory to write recordings into")
+    sync.add_argument("--format", choices=("opus", "raw"), default="opus",
+                      help="output audio format: opus (default) or raw device bytes")
+    sync.add_argument("--stop-recording", action="store_true",
+                      help="allow stopping/finalizing an active or paused recording first; does not restart it")
+    sync.add_argument("--download-timeout", type=float, default=600.0,
+                      help="seconds allowed per recording; default covers a full 60-minute segment")
+    sync.add_argument("--delete-after", action="store_true",
+                      help="delete each recording from the recorder after it is saved locally")
+    sync.add_argument("--yes", action="store_true",
+                      help="confirm permanent deletion (required with --delete-after)")
     args = parser.parse_args()
     try:
         asyncio.run(run(args))

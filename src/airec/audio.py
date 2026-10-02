@@ -64,21 +64,35 @@ def _packet_samples(packet: bytes) -> int:
 def to_ogg_opus(raw: bytes) -> bytes:
     """Return a playable .opus file from verified, fixed-size archive packets.
 
-    Rejects empty or misaligned data and unsupported TOC values. This is not a
-    general-purpose Opus validator: BLE size checks and an end marker must be
-    verified separately. Other device profiles can be saved as raw .airec data.
+    Rejects empty data, inputs shorter than one full packet, unsupported TOC
+    values and invalid trailing remainders. This is not a general-purpose Opus
+    validator: BLE size checks and an end marker must be verified separately.
+    Other device profiles can be saved as raw .airec data.
     """
-    if not raw or len(raw) % 80:
-        raise ValueError("this audio profile requires nonempty 80-byte Opus packets")
+    if len(raw) < 80:
+        raise ValueError("this audio profile requires at least one 80-byte Opus packet")
+    # The firmware sometimes finalizes an archive with a truncated last 80-byte
+    # slot (observed on 6 of 11 archives from one recorder, with remainders of
+    # 32, 48 and 64 bytes). That remainder starts with a plausible TOC byte but can never
+    # form a complete Opus packet, so it is dropped rather than emitted as an
+    # undecodable page. We still require its TOC byte to satisfy the same mono
+    # and duration checks as a full packet. Raw output keeps these bytes.
+    usable = len(raw) - len(raw) % 80
+    tail = raw[usable:]
+    if tail:
+        try:
+            _packet_samples(tail)
+        except (ValueError, IndexError):
+            raise ValueError("truncated final packet has an invalid TOC byte") from None
     head = b"OpusHead" + struct.pack("<BBHIhB", 1, 1, 0, 0, 0, 0)
     vendor = b"airec"
     tags = b"OpusTags" + struct.pack("<I", len(vendor)) + vendor + struct.pack("<I", 0)
     output = bytearray(_page(head, 0, 0, 2) + _page(tags, 1, 0, 0))
     samples = 0
-    for index, start in enumerate(range(0, len(raw), 80), 2):
+    for index, start in enumerate(range(0, usable, 80), 2):
         packet = raw[start:start + 80]
         samples += _packet_samples(packet)
-        flags = 4 if start + 80 == len(raw) else 0
+        flags = 4 if start + 80 == usable else 0
         output.extend(_page(packet, index, samples, flags))
     return bytes(output)
 

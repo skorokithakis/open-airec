@@ -38,6 +38,23 @@ class ActiveRecordingError(ProtocolError):
     """An archive download requires the active/paused recording to be stopped."""
 
 
+class DownloadInterrupted(ProtocolError):
+    """A started archive transfer failed before the verified end marker.
+
+    ``partial`` holds the bytes received contiguously from the requested offset,
+    in order, before the failure. It is non-empty only when a matching ``0x07``
+    acknowledgement (correct ID and full catalog size) was the transfer's valid
+    acknowledgement; a missing, mismatched or rejected (``0xfd``) transfer yields
+    empty ``partial``, because pre-ack bytes cannot be attributed to this
+    archive. It is safe to persist and use as the offset of a later download, but
+    it has not been size/end-verified.
+    """
+
+    def __init__(self, message: str, partial: bytes = b""):
+        super().__init__(message)
+        self.partial = partial
+
+
 @dataclass(frozen=True, slots=True)
 class RecordingStatus:
     state: str  # "recording", "paused", or "stopped"
@@ -57,6 +74,106 @@ class StorageInfo:
     @property
     def used_mb(self) -> int:
         return self.total_mb - self.free_mb
+
+
+# App-derived display names. The recorder may report values outside these sets;
+# those keep their integer code and expose a None name rather than guessing.
+_WORK_MODE_NAMES = {
+    1: "jl + ble",
+    4: "3085 + ble + wifi (legacy)",
+    6: "jl + wifi hotspot",
+    7: "jl + ble + wifi hotspot",
+    8: "jl + ble + wifi station",
+    9: "jl + ble + wifi station + hotspot",
+    10: "3085 + ble + wifi",
+    11: "JL TWS translation earbuds",
+}
+_AUDIO_FORMAT_NAMES = {0: "opus", 1: "wav", 2: "mp3", 3: "pcm"}
+
+
+@dataclass(frozen=True, slots=True)
+class ChipInfo:
+    """Chip work mode and audio format split from one 0x20 byte.
+
+    The integer codes are authoritative; names are app-derived and may be None
+    for a value the app does not describe. This does not expose the app's
+    derived ``chipType`` mapping and is read-only.
+    """
+
+    work_mode: int
+    audio_format: int
+
+    @property
+    def work_mode_name(self) -> str | None:
+        return _WORK_MODE_NAMES.get(self.work_mode)
+
+    @property
+    def audio_format_name(self) -> str | None:
+        return _AUDIO_FORMAT_NAMES.get(self.audio_format)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceSettings:
+    """Read-only 0x26 settings snapshot; ``raw`` always carries the payload.
+
+    The layout is length-dependent. Segment duration and idle shutdown units are
+    unconfirmed, so their raw integer values are reported without conversion.
+    Boolean fields treat a nonzero byte as True. ``None`` marks a field the
+    reported length does not include. This is a read model; no setter exists.
+    """
+
+    noise_reduction: bool
+    led: bool
+    segment_duration: int
+    idle_shutdown: int
+    usb_support: bool
+    mic_gain: int
+    power_on_record: bool
+    disk_format_supported: bool | None
+    default_wifi_on: bool | None
+    default_monitor_on: bool | None
+    raw: bytes
+
+    @classmethod
+    def from_payload(cls, payload: bytes) -> "DeviceSettings":
+        payload = bytes(payload)
+        length = len(payload)
+        if length < 9:
+            raise ProtocolError("device settings payload is too short")
+        if length in (11, 14):
+            raise ProtocolError("device settings payload length does not fit the known layout")
+        noise_reduction = payload[0] != 0
+        led = payload[1] != 0
+        segment_duration = int.from_bytes(payload[3:5], "big")
+        if length in (9, 10):
+            idle_shutdown = payload[5]
+            position = 6
+        else:
+            # Four-byte idle value; shortest complete payload is 12 bytes.
+            idle_shutdown = int.from_bytes(payload[5:9], "big")
+            position = 9
+        usb_support = payload[position] != 0
+        mic_gain = payload[position + 1]
+        power_on_record = payload[position + 2] != 0
+        position += 3
+        if length == 10 or length >= 13:
+            disk_format_supported = payload[position] != 0
+            position += 1
+        else:
+            disk_format_supported = None
+        if length >= 15:
+            default_wifi_on = payload[position] == 1
+            default_monitor_on = payload[position + 1] == 1
+        else:
+            default_wifi_on = None
+            default_monitor_on = None
+        return cls(noise_reduction=noise_reduction, led=led,
+                   segment_duration=segment_duration, idle_shutdown=idle_shutdown,
+                   usb_support=usb_support, mic_gain=mic_gain,
+                   power_on_record=power_on_record,
+                   disk_format_supported=disk_format_supported,
+                   default_wifi_on=default_wifi_on,
+                   default_monitor_on=default_monitor_on, raw=payload)
 
 
 @dataclass(frozen=True, slots=True)
@@ -213,15 +330,15 @@ class AirecClient:
         if not self._client.is_connected:
             raise ConnectionError("recorder disconnected")
         if command == 7:
-            if len(payload) != 18 or payload[14:] != b"\0" * 4:
-                raise ValueError("download requires a timestamp and zero offset")
+            if len(payload) != 18:
+                raise ValueError("download requires a timestamp and four-byte offset")
             _validate_recording_id(payload[:14].decode("ascii"))
         elif command in (2, 10):
             _validate_recording_id(payload.decode("ascii"))
         elif command == 33:
             if payload != b"R":
                 raise ValueError("only ordinary recording mode is supported")
-        elif command not in (1, 3, 4, 5, 8, 11, 14, 15, 16, 48) or payload:
+        elif command not in (1, 3, 4, 5, 8, 11, 14, 15, 16, 18, 32, 38, 41, 48, 54) or payload:
             raise ValueError("command is not an allowed query or download operation")
         data = encode_request(command, payload)
         if self.trace:
@@ -332,6 +449,46 @@ class AirecClient:
             if values[12] > values[13]:
                 raise ProtocolError("reported free storage exceeds total storage")
             return StorageInfo(total_mb=values[13], free_mb=values[12])
+
+    @staticmethod
+    def _decode_text(frame: Frame, label: str) -> str:
+        try:
+            text = frame.payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProtocolError(f"invalid {label} response") from exc
+        if not text:
+            raise ProtocolError(f"empty {label} response")
+        return text
+
+    async def firmware_version(self) -> str:
+        async with self._operation():
+            return self._decode_text(await self._exchange(0x12), "firmware version")
+
+    async def firmware_type(self) -> str:
+        async with self._operation():
+            return self._decode_text(await self._exchange(0x29), "firmware type")
+
+    async def chip_info(self) -> ChipInfo:
+        """Read work mode and audio format from the single 0x20 reply byte."""
+        async with self._operation():
+            frame = await self._exchange(0x20)
+            if len(frame.payload) != 1:
+                raise ProtocolError("chip info response must be exactly one byte")
+            value = frame.payload[0]
+            return ChipInfo(work_mode=value >> 4, audio_format=value & 0x0F)
+
+    async def is_charging(self) -> bool:
+        async with self._operation():
+            frame = await self._exchange(0x36)
+            if len(frame.payload) != 1:
+                raise ProtocolError("charging response must be exactly one byte")
+            return frame.payload[0] == 1
+
+    async def device_settings(self) -> DeviceSettings:
+        """Read the 0x26 settings snapshot; raw bytes are always retained."""
+        async with self._operation():
+            frame = await self._exchange(0x26)
+            return DeviceSettings.from_payload(frame.payload)
 
     @staticmethod
     def _empty_ack(frame):
@@ -481,23 +638,28 @@ class AirecClient:
                 self._expected.clear()
 
     async def download_recording(
-        self, recording: Recording | str, *, timeout: float = 120.0,
+        self, recording: Recording | str, *, offset: int = 0, timeout: float = 120.0,
         max_size: int = 128 * 1024 * 1024, stop_if_recording: bool = False,
     ) -> bytes:
         """Download one archive's raw audio, requiring size and end-marker checks.
 
         A string ID is resolved against a fresh catalog. A Recording supplies its
-        catalog size directly. Data may arrive before the acknowledgement or
-        after the end marker on the separate BLE channel; neither is discarded.
-        Refuses an active/paused recording unless stop_if_recording=True. That
-        option stops/finalizes the current recording after checking status and
-        does not restart it. No clock synchronization, deletion or OTA is sent.
-        On failure/cancellation, stop transfer and disconnect before any retry.
+        catalog size directly. ``offset`` is an in-range starting byte position;
+        the returned/streamed count is catalog size minus offset. Data may arrive
+        before the acknowledgement or after the end marker on the separate BLE
+        channel; neither is discarded. Refuses an active/paused recording unless
+        stop_if_recording=True. That option stops/finalizes the current recording
+        after checking status and does not restart it. No clock synchronization,
+        deletion or OTA is sent. On failure/cancellation, stop transfer and
+        disconnect before any retry. If a started transfer fails, no partial bytes
+        are returned as success; instead DownloadInterrupted carries them.
         """
         if not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("download timeout must be finite and positive")
         if not isinstance(max_size, int) or max_size < 0:
             raise ValueError("max_size must be a nonnegative integer")
+        if not isinstance(offset, int) or isinstance(offset, bool):
+            raise ValueError("download offset must be an integer")
         if isinstance(recording, str):
             _validate_recording_id(recording)
             matches = [row for row in await self.list_recordings() if row.recording_id == recording]
@@ -510,11 +672,17 @@ class AirecClient:
         expected_size = recording.size_bytes
         if expected_size > max_size:
             raise ValueError(f"recording exceeds download limit of {max_size} bytes")
+        # In-range means a byte exists at the offset. An empty archive is the one
+        # exception: its only meaningful (empty) transfer starts at zero.
+        if offset < 0 or offset > expected_size or (offset == expected_size and expected_size > 0):
+            raise ValueError("download offset is outside the recording")
         async with self._lock:
             self._require_ready()
             self._drain()
             self._expected = {15, 4}
             started = False
+            audio = bytearray()
+            acknowledged = False
             try:
                 async with asyncio.timeout(timeout):
                     async with asyncio.timeout(self.timeout):
@@ -543,10 +711,9 @@ class AirecClient:
                         self._bulk_subscribed = True
                     self._download_active = True
                     started = True
-                    await self._write(7, identity + b"\0" * 4)
-                    acknowledged = False
+                    await self._write(7, identity + offset.to_bytes(4, "big"))
                     completed = False
-                    audio = bytearray()
+                    expected_stream = expected_size - offset
                     while True:
                         if self._overflow:
                             raise ProtocolError("download queue overflow; audio is incomplete")
@@ -556,27 +723,30 @@ class AirecClient:
                         if event is None:
                             raise ConnectionError("recorder disconnected during download")
                         if isinstance(event, bytes):
-                            if len(audio) + len(event) > expected_size:
+                            if len(audio) + len(event) > expected_stream:
                                 raise ProtocolError("audio exceeds catalog size")
                             audio.extend(event)
                         elif event.command == 0xFD:
+                            acknowledged = False  # Rejection invalidates pre-ack bytes too.
                             raise ProtocolError("recorder rejected the download (0xfd)")
                         elif event.command == 7:
                             if len(event.payload) != 18 or event.payload[:14] != identity:
+                                acknowledged = False
                                 raise ProtocolError("download acknowledgement has wrong ID or shape")
                             size = int.from_bytes(event.payload[14:], "big")
                             if size != expected_size:
+                                acknowledged = False
                                 raise ProtocolError("download acknowledgement size differs from catalog")
                             acknowledged = True
                         elif event.command == 9:
                             if event.payload:
                                 raise ProtocolError("unexpected download completion payload")
                             completed = True
-                        if acknowledged and completed and len(audio) == expected_size and self._responses.empty():
+                        if acknowledged and completed and len(audio) == expected_stream and self._responses.empty():
                             if self._overflow:
                                 raise ProtocolError("download queue overflow")
                             return bytes(audio)
-            except BaseException:
+            except BaseException as failure:
                 self._ready = False
                 self._download_active = False
                 if started and self._client.is_connected:
@@ -588,6 +758,13 @@ class AirecClient:
                     await self._client.disconnect()
                 except Exception:
                     logging.getLogger(__name__).warning("Download failure cleanup could not disconnect", exc_info=True)
+                # Cancellation is the caller's, not an interruption to resume; it
+                # propagates unchanged. Other in-transfer failures carry the
+                # contiguous prefix only once a matching full-size ack has proved
+                # the bytes belong to this archive; before that it is empty.
+                if started and isinstance(failure, Exception) and not isinstance(failure, DownloadInterrupted):
+                    partial = bytes(audio) if acknowledged else b""
+                    raise DownloadInterrupted(f"archive download interrupted: {failure}", partial) from failure
                 raise
             finally:
                 self._download_active = False

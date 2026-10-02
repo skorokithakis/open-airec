@@ -3,7 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from airec import ActiveRecordingError, AirecClient, Frame, ProtocolError, Recording
+from airec import ActiveRecordingError, AirecClient, DownloadInterrupted, Frame, ProtocolError, Recording
 from airec.client import ARCHIVE_NOTIFY
 from test_client import FakeBleak
 
@@ -80,14 +80,74 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
         self.client._client.events = [Frame(7, ID.encode() + b"\0" * 4), END]
         self.assertEqual(await self.client.download_recording(recording), b"")
 
-    async def test_timeout_on_missing_marker_or_bytes(self):
-        for events in ([ACK, AUDIO], [ACK, END, AUDIO[:-1]], [AUDIO, END]):
+    async def test_interruption_carries_contiguous_partial(self):
+        # Missing bytes/marker/timeout after the transfer started: the exception
+        # carries exactly the received prefix, still cancelling and disconnecting.
+        for events, expected_partial in (
+            ([ACK], b""),
+            ([ACK, AUDIO[:5]], AUDIO[:5]),
+            ([ACK, AUDIO], AUDIO),
+            ([ACK, END, AUDIO[:-1]], AUDIO[:-1]),
+        ):
             self.client._client.events = events
-            with self.assertRaises(TimeoutError):
+            with self.assertRaises(DownloadInterrupted) as caught:
                 await self.client.download_recording(RECORDING, timeout=0.01)
+            self.assertEqual(caught.exception.partial, expected_partial)
             self.assertEqual(self.client._client.writes[-1], bytes.fromhex("55aa0108"))
             self.assertFalse(self.client._client.is_connected)
             await self.client.connect()
+
+    async def test_partial_is_empty_without_a_matching_ack(self):
+        # Pre-ack bytes cannot be attributed to this archive, so they are dropped.
+        # A rejection invalidates any prefix even if an ack was already seen.
+        for events in ([AUDIO], [AUDIO, END], [AUDIO, Frame(0xFD, b"")], [ACK, AUDIO, Frame(0xFD, b"")]):
+            self.client._client.events = events
+            with self.assertRaises(DownloadInterrupted) as caught:
+                await self.client.download_recording(RECORDING, timeout=0.01)
+            self.assertEqual(caught.exception.partial, b"")
+            await self.client.connect()
+
+    async def test_partial_is_empty_when_ack_mismatches_after_bytes(self):
+        for bad_ack in (Frame(7, b"wrong"), Frame(7, ID.encode() + (RECORDING.size_bytes - 1).to_bytes(4, "big"))):
+            self.client._client.events = [AUDIO, bad_ack]
+            with self.assertRaises(DownloadInterrupted) as caught:
+                await self.client.download_recording(RECORDING)
+            self.assertEqual(caught.exception.partial, b"")
+            await self.client.connect()
+
+    async def test_offsets_are_sent_and_stream_size_follows_offset(self):
+        offset = 5
+        for value in (offset, len(AUDIO) - 1):
+            self.client._client.events = [ACK, AUDIO[value:], END]
+            self.assertEqual(await self.client.download_recording(RECORDING, offset=value), AUDIO[value:])
+            self.assertEqual(self.client._client.writes[-1],
+                             bytes.fromhex("55aa1307") + ID.encode() + value.to_bytes(4, "big"))
+
+    async def test_nonzero_offset_ack_mismatch_and_interruption(self):
+        offset = 5
+        remaining = len(AUDIO) - offset
+        # The probe proved the ack always carries the full catalog size, so a
+        # remaining-size ack must be rejected even though the stream is shorter.
+        self.client._client.events = [Frame(7, ID.encode() + remaining.to_bytes(4, "big")), AUDIO[offset:], END]
+        with self.assertRaisesRegex(ProtocolError, "acknowledgement"):
+            await self.client.download_recording(RECORDING, offset=offset)
+        await self.client.connect()
+        self.client._client.events = [ACK, AUDIO[offset:offset + 3]]
+        with self.assertRaises(DownloadInterrupted) as caught:
+            await self.client.download_recording(RECORDING, offset=offset, timeout=0.01)
+        self.assertEqual(caught.exception.partial, AUDIO[offset:offset + 3])
+        await self.client.connect()
+
+    async def test_offset_out_of_range_sends_nothing(self):
+        before = len(self.client._client.writes)
+        size = RECORDING.size_bytes
+        for value in (-1, size, size + 1, 1.5, True):
+            with self.assertRaises(ValueError):
+                await self.client.download_recording(RECORDING, offset=value)
+        empty = Recording(ID, b"\0" * 4)
+        with self.assertRaises(ValueError):
+            await self.client.download_recording(empty, offset=1)
+        self.assertEqual(len(self.client._client.writes), before)
 
     async def test_wrong_identity_size_and_malformed_completion(self):
         for event in (Frame(7, b"wrong"), Frame(7, b"20261002023329" + RECORDING.metadata),
@@ -111,8 +171,9 @@ class DownloadTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_disconnect_and_cancellation(self):
         self.client._client.events = [ACK, None]
-        with self.assertRaises(ConnectionError):
+        with self.assertRaises(DownloadInterrupted) as caught:
             await self.client.download_recording(RECORDING)
+        self.assertEqual(caught.exception.partial, b"")
         await self.client.connect()
         self.client._client.events = []
         task = asyncio.create_task(self.client.download_recording(RECORDING))

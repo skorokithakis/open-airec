@@ -1,12 +1,13 @@
 import json
 import os
+import tempfile
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
 from datetime import datetime
 from io import StringIO
 from unittest.mock import AsyncMock, patch
 
-from airec import Recording, Recorder, RecordingStatus, StorageInfo
+from airec import DownloadInterrupted, Recording, Recorder, RecordingStatus, StorageInfo
 from airec.__main__ import _select_device, main
 from airec.report import human_size, render_text
 
@@ -222,6 +223,242 @@ class OutputFormatTests(unittest.TestCase):
     def test_human_size_uses_decimal_units(self):
         self.assertEqual([human_size(n) for n in (0, 999, 1000, 1500, 10 * 1000 * 1000)],
                          ["0 B", "999 B", "1.0 KB", "1.5 KB", "10.0 MB"])
+
+
+class DownloadCommandTests(unittest.TestCase):
+    """Resume-aware download behavior against a fake connected client."""
+
+    ID = "20260101120000"
+
+    def _help(self, *argv):
+        output = StringIO()
+        with patch("sys.argv", ["airec", *argv]), redirect_stdout(output):
+            with self.assertRaises(SystemExit):
+                main()
+        return output.getvalue()
+
+    def test_download_resumes_from_part_and_reports_json(self):
+        audio = b"abcdefghij"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "out.airec")
+            part = os.path.join(directory, f"{self.ID}.part")
+            with open(part, "wb") as handle:
+                handle.write(audio[:4])
+            client = _FakeClient(
+                list_recordings=AsyncMock(return_value=(_recording(self.ID, len(audio)),)),
+                download_recording=AsyncMock(return_value=audio[4:]),
+            )
+            code, output, error = _run(
+                ["--json", "download", self.ID, "--output", destination, "--format", "raw"],
+                client=client)
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), audio)
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        self.assertEqual(client.download_recording.await_args.kwargs["offset"], 4)
+        self.assertFalse(os.path.exists(part))
+        payload = json.loads(output)
+        self.assertEqual(payload["resumed_from"], 4)
+        self.assertEqual(payload["bytes"], len(audio) - 4)
+        self.assertEqual(payload["raw_size_bytes"], len(audio))
+
+    def test_interruption_persists_part_and_asks_to_rerun(self):
+        partial = b"abc"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "out.airec")
+            part = os.path.join(directory, f"{self.ID}.part")
+            client = _FakeClient(
+                list_recordings=AsyncMock(return_value=(_recording(self.ID, 10),)),
+                download_recording=AsyncMock(side_effect=DownloadInterrupted(
+                    "archive download interrupted: disconnected", partial)),
+            )
+            code, _, error = _run(
+                ["download", self.ID, "--output", destination, "--format", "raw"],
+                client=client)
+            with open(part, "rb") as handle:
+                self.assertEqual(handle.read(), partial)
+        self.assertEqual(code, 1)
+        self.assertIn("rerun the same command to resume", error)
+        self.assertIn("DownloadInterrupted", error)
+        self.assertFalse(os.path.exists(destination))
+
+    def test_persistence_failure_exits_nonzero_without_resume_hint(self):
+        partial = b"abc"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "out.airec")
+            client = _FakeClient(
+                list_recordings=AsyncMock(return_value=(_recording(self.ID, 10),)),
+                download_recording=AsyncMock(side_effect=DownloadInterrupted(
+                    "archive download interrupted: disconnected", partial)),
+            )
+            with patch("airec.sync._append_partial", side_effect=OSError("disk full")):
+                code, _, error = _run(
+                    ["download", self.ID, "--output", destination, "--format", "raw"],
+                    client=client)
+        self.assertEqual(code, 1)
+        self.assertIn("OSError", error)
+        self.assertIn("disk full", error)
+        self.assertNotIn("rerun the same command to resume", error)
+
+    def test_output_cannot_be_the_reserved_scratch_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            reserved = os.path.join(directory, f"{self.ID}.part")
+            with open(reserved, "wb") as handle:
+                handle.write(b"prior partial")
+            output, error = StringIO(), StringIO()
+            with patch("sys.argv", ["airec", "download", self.ID, "--output", reserved,
+                                    "--format", "raw"]), \
+                    patch("airec.__main__._select_device", new=AsyncMock()) as select, \
+                    patch("airec.__main__.find_recorders", new=AsyncMock()) as scan, \
+                    redirect_stdout(output), redirect_stderr(error):
+                code = main()
+            self.assertEqual(code, 1)
+            self.assertIn("reserved", error.getvalue())
+            with open(reserved, "rb") as handle:
+                self.assertEqual(handle.read(), b"prior partial")
+        select.assert_not_awaited()
+        scan.assert_not_awaited()
+
+    def test_oversized_part_is_discarded_and_download_restarts(self):
+        audio = b"abcdefghij"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "out.airec")
+            part = os.path.join(directory, f"{self.ID}.part")
+            with open(part, "wb") as handle:
+                handle.write(audio + b"extra")
+            client = _FakeClient(
+                list_recordings=AsyncMock(return_value=(_recording(self.ID, len(audio)),)),
+                download_recording=AsyncMock(return_value=audio),
+            )
+            code, _, _ = _run(
+                ["download", self.ID, "--output", destination, "--format", "raw"],
+                client=client)
+            with open(destination, "rb") as handle:
+                self.assertEqual(handle.read(), audio)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.download_recording.await_args.kwargs["offset"], 0)
+        self.assertFalse(os.path.exists(part))
+
+    def test_download_timeout_defaults_to_six_hundred(self):
+        audio = b"abcd"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "out.airec")
+            client = _FakeClient(
+                list_recordings=AsyncMock(return_value=(_recording(self.ID, len(audio)),)),
+                download_recording=AsyncMock(return_value=audio),
+            )
+            code, _, _ = _run(
+                ["download", self.ID, "--output", destination, "--format", "raw"],
+                client=client)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.download_recording.await_args.kwargs["timeout"], 600.0)
+
+    def test_download_and_sync_format_help_is_present(self):
+        download_help = self._help("download", "--help")
+        self.assertIn("--format", download_help)
+        self.assertIn("--download-timeout", download_help)
+        self.assertIn("output audio format", download_help)
+        sync_help = self._help("sync", "--help")
+        self.assertIn("--format", sync_help)
+        self.assertIn("output audio format", sync_help)
+
+
+class SyncCommandTests(unittest.TestCase):
+    def _sync_client(self, *, status="stopped", recordings=(), downloaded=b"\x01\x02"):
+        return _FakeClient(
+            recording_status=AsyncMock(return_value=RecordingStatus(status)),
+            list_recordings=AsyncMock(return_value=tuple(recordings)),
+            download_recording=AsyncMock(return_value=downloaded),
+            delete_recording=AsyncMock(return_value=None),
+        )
+
+    def test_sync_text_prints_progress_and_summary(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(recordings=(recording,))
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, error = _run(["sync", directory, "--format", "raw"], client=client)
+            self.assertTrue(os.path.exists(os.path.join(directory, "20260101120000.airec")))
+        self.assertEqual(code, 0)
+        self.assertEqual(error, "")
+        self.assertIn("Downloaded 20260101120000 (2 bytes)", output)
+        self.assertIn(f"Synced to {directory}: 1 downloaded, 0 resumed, 0 skipped, 0 deleted.", output)
+
+    def test_sync_json_shape(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(recordings=(recording,))
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _ = _run(["--json", "sync", directory, "--format", "raw"], client=client)
+        self.assertEqual(code, 0)
+        payload = json.loads(output)
+        self.assertEqual(payload["directory"], directory)
+        self.assertEqual(payload["format"], "raw")
+        self.assertEqual(payload["events"], [{
+            "action": "downloaded", "recording_id": "20260101120000",
+            "bytes": 2, "resumed_from": None, "error": None,
+        }])
+
+    def test_sync_json_reports_failure_with_events_and_nonzero_exit(self):
+        recordings = (_recording("20260101120000", 2), _recording("20260101130000", 2))
+        client = _FakeClient(
+            recording_status=AsyncMock(return_value=RecordingStatus("stopped")),
+            list_recordings=AsyncMock(return_value=recordings),
+            download_recording=AsyncMock(side_effect=[
+                b"\x01\x02", DownloadInterrupted("simulated interruption", b"")]),
+            delete_recording=AsyncMock(return_value=None),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _ = _run(["--json", "sync", directory, "--format", "raw"],
+                                   client=client)
+        self.assertEqual(code, 1)
+        payload = json.loads(output)
+        self.assertEqual([event["action"] for event in payload["events"]],
+                         ["downloaded", "failed"])
+        self.assertEqual(payload["events"][1]["recording_id"], "20260101130000")
+        self.assertIn("DownloadInterrupted", payload["error"])
+
+    def test_sync_refuses_recording_without_stop_flag(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(status="recording", recordings=(recording,))
+        with tempfile.TemporaryDirectory() as directory:
+            code, _, error = _run(["sync", directory, "--format", "raw"], client=client)
+        self.assertEqual(code, 1)
+        self.assertIn("ActiveRecordingError", error)
+        client.list_recordings.assert_not_awaited()
+
+    def test_sync_stop_flag_finalizes_first(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(status="recording", recordings=(recording,))
+        client.stop_recording = AsyncMock(return_value=recording)
+        with tempfile.TemporaryDirectory() as directory:
+            code, _, _ = _run(["sync", directory, "--format", "raw", "--stop-recording"], client=client)
+        self.assertEqual(code, 0)
+        client.stop_recording.assert_awaited_once()
+
+    def test_sync_download_timeout_is_forwarded(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(recordings=(recording,))
+        with tempfile.TemporaryDirectory() as directory:
+            code, _, _ = _run(["sync", directory, "--format", "raw",
+                               "--download-timeout", "42"], client=client)
+        self.assertEqual(code, 0)
+        self.assertEqual(client.download_recording.await_args.kwargs["timeout"], 42.0)
+
+    def test_sync_delete_after_requires_yes(self):
+        client = self._sync_client()
+        with tempfile.TemporaryDirectory() as directory:
+            code, _, error = _run(["sync", directory, "--delete-after"], client=client)
+        self.assertEqual(code, 1)
+        self.assertIn("--yes", error)
+
+    def test_sync_delete_after_deletes_published_recording(self):
+        recording = _recording("20260101120000", 2)
+        client = self._sync_client(recordings=(recording,))
+        with tempfile.TemporaryDirectory() as directory:
+            code, output, _ = _run(["sync", directory, "--format", "raw", "--delete-after", "--yes"],
+                                   client=client)
+        self.assertEqual(code, 0)
+        client.delete_recording.assert_awaited_once_with("20260101120000")
+        self.assertIn("Deleted 20260101120000 from recorder", output)
 
 
 class GlobalOptionPlacementTests(unittest.TestCase):

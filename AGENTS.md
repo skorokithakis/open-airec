@@ -27,8 +27,9 @@ requires reviewing that compatibility dependency.
   NOT a current-file query. Do not reuse the obsolete upstream initialization.
 - Start is 0x03 plus 0x21 R after 100 ms; no 0x21 ack on tested firmware.
 - Pause/resume requires status checks around a single 0x10 toggle.
-- Catalog needs explicit 0x06 end; download needs matching ID/size ack, exact
-  byte count and 0x09 end; no timeout-as-empty/partial-success behavior.
+- Catalog needs explicit 0x06 end; download needs matching ID and full-size ack
+  (any in-range offset), exact size-minus-offset byte count and 0x09 end; no
+  timeout-as-empty/partial-success behavior.
 - Delete one ID only, require stopped state and unique fresh catalog match,
   verify absence. Clock setting also requires stopped state. No implicit stop
   except explicitly opted-in download finalization. No automatic mutation retry.

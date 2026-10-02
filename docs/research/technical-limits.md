@@ -22,6 +22,12 @@ user-facing limits, see [limitations](../limitations.md).
   packets without re-encoding. Encoder delay is unknown (pre-skip zero), and
   packet checks are not a complete Opus bitstream validator. Other profiles can
   be saved raw, but are not guaranteed playable. No WAV/MP3 decoding API exists.
+  The firmware may finalize an archive with a truncated final 80-byte slot
+  (observed on 6 of 11 archives from one recorder, with remainders of 32, 48
+  and 64 bytes). The Ogg wrapper drops such a tail after it checks the tail's
+  leading TOC byte. Up to 79 trailing raw bytes can be left out of the wrapped
+  audio. `format="raw"` preserves them. The missing bytes cannot be
+  reconstructed.
 - `save_audio()` uses a temporary file and hard link for atomic no-overwrite
   publication. Filesystems without hard-link support fail rather than silently
   falling back to an unsafe overwrite. The parent directory must exist.
@@ -31,6 +37,27 @@ user-facing limits, see [limitations](../limitations.md).
   historical timezone recovery is performed. IDs are second-resolution timestamps;
   same-second collisions are not resolved automatically. Deletion rejects duplicate
   catalog IDs rather than guessing which recording to remove.
+- Device-info queries are read-only and empty-payload. Some `0x26` field units are
+  unconfirmed: segment duration is labelled minutes and idle shutdown has no proven
+  unit. `disk_format` is a capability flag, not an action, and default
+  Wi-Fi/monitor flags are only present on longer payloads. Unknown work modes and
+  audio formats must be tolerated rather than assumed.
+- Download offsets are honored byte-exactly, including unaligned offsets. The
+  `0x07` acknowledgement always carries the full catalog size, so the expected
+  stream length is catalog size minus offset, not the remaining size in the ack.
+- The firmware may answer `0x08` with `0xfd`; either is a stop response.
+- The app accepts `0x09` once the local file reaches 50% of the expected size,
+  ignores the `0x07` ack payload and adds stall/timeout heuristics. This client
+  deliberately keeps exact byte-count and ID/size validation; do not copy the app's
+  leniency.
+- The app itself auto-deletes recordings shorter than 5 s. Short recordings can
+  therefore disappear through app cleanup, firmware discard or both; the cause of
+  the observed unsolicited `0x0a` is unconfirmed.
+- Never query `0x64` (it returns stored Wi-Fi credentials) and never send the OTA,
+  format or bulk-delete opcodes (`0x25`, `0x27`, `0x28`, `0x3c`, `0x34`), Wi-Fi
+  writes or setting writes. See [protocol](protocol.md#excluded-commands).
+- These findings rely on one recorder and firmware. New commands require acquiring
+  a compatible APK snapshot again; the decompiled evidence is not distributed.
 
 The app's `0x04` command stops and finalizes the current recording. It is not
 a query. Do not use it to read state.

@@ -79,12 +79,73 @@ def _clock_text(payload: dict) -> str:
     return f"Device local time: {payload['device_local_time']}"
 
 
+def _named(value, name) -> str:
+    return f"{value} ({name})" if name else f"{value} (unknown)"
+
+
+def _flag(value) -> str:
+    if value is None:
+        return "unknown"
+    return "yes" if value else "no"
+
+
+def _info_text(payload: dict) -> str:
+    chip = payload["chip_info"]
+    settings = payload["device_settings"]
+    return "\n".join((
+        f"Firmware version: {payload['firmware_version']}",
+        f"Firmware type: {payload['firmware_type']}",
+        f"Chip work mode: {_named(chip['work_mode'], chip['work_mode_name'])}",
+        f"Chip audio format: {_named(chip['audio_format'], chip['audio_format_name'])}",
+        f"Charging: {_flag(payload['is_charging'])}",
+        f"Device settings (raw {settings['raw']}):",
+        f"  Noise reduction: {_flag(settings['noise_reduction'])}",
+        f"  LED: {_flag(settings['led'])}",
+        f"  Segment duration: {settings['segment_duration']} (unit unconfirmed)",
+        f"  Idle shutdown: {settings['idle_shutdown']} (unit unconfirmed)",
+        f"  USB support: {_flag(settings['usb_support'])}",
+        f"  Mic gain: {settings['mic_gain']}",
+        f"  Power-on recording: {_flag(settings['power_on_record'])}",
+        f"  Disk format supported: {_flag(settings['disk_format_supported'])}",
+        f"  Default Wi-Fi on: {_flag(settings['default_wifi_on'])}",
+        f"  Default monitor on: {_flag(settings['default_monitor_on'])}",
+    ))
+
+
 def _download_text(payload: dict) -> str:
     raw, file_size = payload["raw_size_bytes"], payload["file_size_bytes"]
     return "\n".join((f"Recording ID: {payload['recording_id']}",
                       f"Path: {payload['path']}",
                       f"Raw size: {human_size(raw)} ({raw} bytes)",
                       f"File size: {human_size(file_size)} ({file_size} bytes)"))
+
+
+def render_sync_event(event: dict) -> str:
+    """Render one bulk-sync progress line for the CLI."""
+
+    action, recording_id = event["action"], event["recording_id"]
+    if action == "skipped":
+        return f"Skipped {recording_id} (already present)"
+    if action == "downloaded":
+        return f"Downloaded {recording_id} ({event['bytes']} bytes)"
+    if action == "resumed":
+        return f"Resumed {recording_id} from {event['resumed_from']} bytes ({event['bytes']} more)"
+    if action == "deleted":
+        return f"Deleted {recording_id} from recorder"
+    if action == "failed":
+        return f"Failed {recording_id}: {event['error']}"
+    raise ValueError(f"unknown sync event action: {action}")
+
+
+def _sync_text(payload: dict) -> str:
+    counts = {}
+    for event in payload["events"]:
+        counts[event["action"]] = counts.get(event["action"], 0) + 1
+    return (f"Synced to {payload['directory']}: "
+            f"{counts.get('downloaded', 0)} downloaded, "
+            f"{counts.get('resumed', 0)} resumed, "
+            f"{counts.get('skipped', 0)} skipped, "
+            f"{counts.get('deleted', 0)} deleted.")
 
 
 _RENDERERS = {
@@ -99,7 +160,9 @@ _RENDERERS = {
     "delete": _delete_text,
     "clock": _clock_text,
     "set-clock": _clock_text,
+    "info": _info_text,
     "download": _download_text,
+    "sync": _sync_text,
 }
 
 

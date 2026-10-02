@@ -65,6 +65,8 @@ not guaranteed. There are no implicit connections or mutation retries.
 
 `ProtocolError` means a malformed, inconsistent or rejected device response.
 `ActiveRecordingError` extends it for forbidden active/paused recording states.
+`DownloadInterrupted` extends it and adds `.partial` for a started transfer that
+failed before the verified end marker.
 `ConnectionError` signals disconnected/not initialized; `TimeoutError` signals a
 missing response/deadline. Invalid caller input raises `ValueError`; BLE/OS
 exceptions can also propagate. After operation failure, reconnect before reuse.
@@ -80,6 +82,14 @@ preserves an original error if disconnection also fails.
 | `await recording_status()` | `RecordingStatus(state, recording_id=None)` |
 | `await list_recordings()` | Tuple of `Recording` rows through the explicit end marker |
 | `await clock()` | Naive `datetime` containing device-local wall time |
+| `await firmware_version()` | Firmware version string (whole payload decoded as UTF-8) |
+| `await firmware_type()` | Firmware/board type string (whole payload decoded as UTF-8) |
+| `await chip_info()` | `ChipInfo(work_mode, audio_format)` |
+| `await is_charging()` | `True` when the one-byte 0x36 reply is `1`, else `False` |
+| `await device_settings()` | Length-dependent `DeviceSettings` snapshot, raw bytes included |
+
+These five queries are read-only, send an empty request payload and never mutate
+device state. A malformed, empty or wrong-length reply raises `ProtocolError`.
 
 Models are immutable dataclasses:
 
@@ -89,6 +99,18 @@ Models are immutable dataclasses:
 - `RecordingStatus`: `state` is `recording`, `paused`, or `stopped`.
   `recording_id` is available for active status, not the paused/stopped wire reply.
 - `StorageInfo`: coarse firmware MB; `used_mb = total_mb - free_mb`.
+- `ChipInfo(work_mode, audio_format)`: the integer codes are authoritative;
+  `work_mode_name` and `audio_format_name` return an app-derived display name, or
+  `None` when the code is unknown. The app's derived `chipType` mapping is not
+  exposed.
+- `DeviceSettings`: a read-only snapshot of the variable-length 0x26 reply. It
+  carries `noise_reduction`, `led`, `segment_duration`, `idle_shutdown`,
+  `usb_support`, `mic_gain`, `power_on_record`, `disk_format_supported`,
+  `default_wifi_on` and `default_monitor_on`, plus the exact `raw` payload bytes.
+  Boolean fields treat a nonzero byte as `True`; `None` means the reported length
+  omits that field. `segment_duration` and `idle_shutdown` are reported as raw
+  integers because their units are unconfirmed. Fields are parsed by payload
+  length (`9`, `10`, `12`, `13` and `>= 15`); other lengths raise `ProtocolError`.
 
 ## Recording controls
 
@@ -113,12 +135,18 @@ async with AirecClient(device) as recorder:
 
 ## Archive downloading and output
 
-`await download_recording(recording, *, timeout=120.0,
+`await download_recording(recording, *, offset=0, timeout=120.0,
 max_size=128 * 1024 * 1024, stop_if_recording=False) -> bytes`
 
 - `recording`: a `Recording` with valid four-byte metadata, or an ID string
   resolved uniquely against a fresh catalog. Caller-supplied metadata may be
   stale; acknowledgement size must match it or the operation fails.
+- `offset`: in-range starting byte position (`0 <= offset < catalog size`; an
+  empty recording may only start at `0`). The request carries the four-byte
+  big-endian offset and the device streams `size - offset` bytes. Resume is
+  caller-managed. On failure, append `partial` to the bytes you already hold
+  and retry with `offset + len(partial)`. That is the total length of the
+  bytes you hold, not the length of `partial` alone.
 - `timeout`: finite positive overall transfer/preflight deadline. Resolving a
   string uses a separate catalog query timeout; preflight queries also use the
   client's query timeout within the transfer deadline.
@@ -128,18 +156,71 @@ max_size=128 * 1024 * 1024, stop_if_recording=False) -> bytes`
   Defaults to refusal. Does not restart recording afterward.
 
 Only complete, size-checked transfers with acknowledgement and completion marker
-are returned. Failure/cancellation attempts `0x08` cancellation and disconnects.
-Zero-offset downloads only; no append/resume/progress/streaming API.
+are returned. The `0x07` acknowledgement always reports the full catalog size,
+regardless of offset; the required stream length is catalog size minus offset.
+Failure/cancellation attempts `0x08` cancellation and disconnects. A failure
+after the transfer started raises `DownloadInterrupted` (a `ProtocolError`)
+whose `.partial` holds the contiguous bytes received from `offset`. It is
+non-empty only when a matching `0x07` acknowledgement (correct ID and full
+catalog size) was the transfer's valid acknowledgement; a missing, mismatched or
+rejected (`0xfd`) transfer yields empty `.partial`, because pre-ack bytes cannot
+be attributed to this archive. It is never returned as success and is not
+size/end-verified. No streaming, progress or automatic retry/reconnect API
+exists.
 
 `to_ogg_opus(raw: bytes) -> bytes` losslessly wraps the supported archive profile
-in Ogg Opus; it does not decode, transcribe or re-encode. Empty/misaligned/unsupported
-profiles raise `ValueError`.
+in Ogg Opus; it does not decode, transcribe or re-encode. A trailing remainder
+shorter than 80 bytes is treated as a firmware-truncated final slot and dropped,
+provided its leading TOC byte passes the same mono/duration checks as a full
+packet. Empty data, inputs shorter than one full packet, unsupported TOC values
+and an invalid trailing TOC raise `ValueError`. Full packets are preserved
+bit-for-bit. Up to 79 trailing raw bytes can be left out of the wrapped audio.
+`format="raw"` keeps every byte.
 
 `save_audio(raw, destination, *, format="opus") -> pathlib.Path` converts to Ogg
 Opus or preserves bytes with `format="raw"`. It writes/fsyncs a sibling temporary
 file, hard-links atomically into place, and removes the temporary file. Parent
 directory must exist. Existing files/symlinks raise `FileExistsError`; disk and
 filesystem errors propagate. Publication does not claim directory-fsync durability.
+
+## Bulk sync
+
+`await sync_directory(client, directory, *, format="opus", stop_recording=False,
+delete_after=False, download_timeout=600.0, progress=None) -> tuple[SyncEvent, ...]`
+
+Downloads every catalog recording missing from `directory` using one connected
+`AirecClient`. `directory` must already exist; `format` is `"opus"` (`.opus`
+output) or `"raw"` (`.airec`). Output files that already exist are skipped, not
+compared or overwritten. Each recording is downloaded, checked to equal its
+catalog size, then published with `save_audio`. `download_timeout` is the
+per-file transfer deadline passed to `download_recording`; the 600 s default
+covers a full 60-minute segment at measured BLE throughput (~110-130 KB/s).
+
+When the recorder is recording or paused, the call raises `ActiveRecordingError`
+unless `stop_recording=True`, in which case the active recording is finalized
+once through the normal stop path before the catalog is fetched, so the finalized
+entry is included. No recording is restarted.
+
+Interrupted transfers are resumable. On a `DownloadInterrupted`, the attributable
+bytes are appended to `directory/<ID>.part` (append, then fsync; an empty
+`.partial` creates no file). On the next run a `.part` shorter than the catalog
+size resumes from its length and is concatenated with the new bytes; a `.part` at
+least as large as the catalog entry is discarded and restarted from zero. A
+`.part` that is not an ordinary regular file (for example a symlink) is refused.
+The `.part` file is removed only after the complete recording is published.
+
+`delete_after=True` calls `delete_recording()` for each recording this run
+published (resumed files included) only after its local file exists. Skipped
+files are never deleted. `progress(event)` is an optional synchronous callback
+that receives one `SyncEvent` per recording. `SyncEvent` fields are `action`
+(`skipped`, `downloaded`, `resumed`, `deleted` or `failed`), `recording_id`,
+`bytes` (raw bytes transferred this run), `resumed_from` (nonzero resume offset
+or `None`) and `error` (failure summary).
+
+The first failure stops the run and raises `SyncFailed` (a `RuntimeError`) whose
+`.events` holds every outcome reached, including the terminal `failed` event, with
+the original exception chained as `__cause__`. There is no retry, reconnect,
+concurrency or byte-level progress; rerunning continues from what remains.
 
 ## Deletion and clock setting
 
